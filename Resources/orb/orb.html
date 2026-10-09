@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>SISO Voice — JARVIS Orb</title>
+<!--
+  JARVIS ORB — assistant face for SISO Voice.  ARCHITECTURE (per .claude/plans/jarvis-orb-build.md).
+
+  This file is structured into 5 MODULES so build tasks own different code (no collisions):
+    stateStore      — continuous state + lerp targets (phase, audio{mic,tts}, energy E, quality,
+                      visibility, size). Monotonic stateVersion; stale updates dropped.
+    eventQueue      — append-only TRANSIENT one-shots {seq,type,payload,ts,ttl,seed,amp,consumed}.
+                      Strikes / ingest-bursts / flares live HERE, not in state, so repeats don't collapse.
+    scheduler       — render loop: adaptive fps, visibility pause/resume, step(dtMs) deterministic
+                      stepping, frame counter, simTime. NO WebGL knowledge.
+    rendererAdapter — apply(model) with renderer-NEUTRAL inputs {phase,audio,energy,transients,
+                      quality,visibility,size}. ALL WebGL + GL-context-loss + CSS-fallback lives here.
+    publicApi       — createOrb(canvas,opts)->instance; window.__orb (default overlay instance);
+                      window.__orbDispatch; back-compat shims; ack/error channel to Swift.
+
+  CONTRACT (window.__orb on the default instance):
+    mount(canvasEl, opts)         (createOrb already mounts; mount re-binds if needed)
+    setAudio({mic, tts})          0..1 each; mic = my voice, tts = assistant's voice (future)
+    setState({phase, event})      phase: idle|listening|transcribing|speaking|thinking|error
+    dispatch(msg)                 = __orbDispatch; {seq,type,payload,ts}
+    step(dtMs)                    advance sim + render ONE frame WITHOUT rAF (deterministic verify)
+    resize(w,h,dpr) / setVisible(bool) / destroy()
+    debug()                       -> {stateVersion,lastEventSeq,phase,audio,energyE,frame,simTime,
+                                       fps,renderer,glLost,queueLen,adapter}
+
+  Swift pushes via window.__orbDispatch(...). JS posts ack/error back via
+    window.webkit.messageHandlers.orb.postMessage({seq,type:'ack'|'error',msg}).
+
+  HARD CONSTRAINTS: global/UMD Three r149 (vendor/three.global.js) — NO modules/importmap/addons/
+  postprocessing/FBO. Transparent renderer. file://-safe in WKWebView. Glow faked (additive+1/d²+
+  Fresnel+CSS halo), NO UnrealBloom.
+
+  STATUS: T1 (this commit) = contract + module skeleton + STUB renderer (phase-colored circle).
+  T2 fills rendererAdapter with the measured JARVIS look.
+-->
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:transparent; overflow:hidden; }
+  #halo { position:fixed; inset:0; pointer-events:none; z-index:0; }   /* CSS glow-fallback layer (T2) */
+  #orb  { display:block; width:100vw; height:100vh; background:transparent; position:relative; z-index:1; }
+  #fallback { position:fixed; inset:0; display:none; align-items:center; justify-content:center; z-index:2; pointer-events:none; }
+  #fallback.show { display:flex; }
+  #fallback .dot { width:46%; height:46%; border-radius:50%;
+    background:radial-gradient(circle at 50% 45%, #FFE9A8 0%, #FFB020 38%, rgba(138,61,10,0.5) 70%, rgba(0,0,0,0) 100%); }
+  #status-dot { position:fixed; left:50%; bottom:14px; transform:translateX(-50%); width:11px; height:11px;
+    border-radius:50%; background:#8a8f96; transition:background .2s ease, box-shadow .2s ease; z-index:3; }
+  #status-dot.listening { background:#FF3B30; box-shadow:0 0 10px 2px rgba(255,59,48,.8); animation:dp 1.1s ease-in-out infinite; }
+  #status-dot.transcribing { background:#FFB066; box-shadow:0 0 9px 2px rgba(255,176,102,.7); animation:dp .7s ease-in-out infinite; }
+  #status-dot.thinking { background:#FFD27A; box-shadow:0 0 9px 2px rgba(255,210,122,.7); animation:dp 1.4s ease-in-out infinite; }
+  #status-dot.speaking { background:#FFC23A; box-shadow:0 0 9px 2px rgba(255,194,58,.7); }
+  #status-dot.error { background:#CC4466; box-shadow:0 0 9px 2px rgba(204,68,102,.7); }
+  @keyframes dp { 0%,100%{opacity:1} 50%{opacity:.35} }
+</style>
+<script src="vendor/three.global.js"></script>
+</head>
+<body>
+<canvas id="halo"></canvas>
+<canvas id="orb"></canvas>
+<div id="fallback"><div class="dot"></div></div>
+<div id="status-dot"></div>
+
+<script>
+"use strict";
+(function () {
+
+// ===== ack/error channel to Swift =====================================
+function postToSwift(payload) {
+  try {
+    if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.orb) {
+      window.webkit.messageHandlers.orb.postMessage(payload);
+    }
+  } catch (e) { /* host may not be WKWebView (headless verify) — ignore */ }
+}
+
+const PHASES = ['idle','listening','transcribing','speaking','thinking','error'];
+
+// =====================================================================
+//  createOrb(canvas, opts) -> instance.  All 5 modules are closures over
+//  per-instance state, so multiple orbs (overlay + drawer) don't share.
+// =====================================================================
+function createOrb(canvas, opts) {
+  opts = opts || {};
+  const haloCanvas = opts.halo || null;
+  const statusDot  = opts.statusDot || null;
+  const fallbackEl = opts.fallback || null;
+
+  // ---- stateStore -----------------------------------------------------
+  const state = {
+    phase: 'idle',
+    audio: { mic: 0, tts: 0 },
+    energyE: 0,          // 0 calm .. 1 agitated (T3 maps audio->E; lerped)
+    quality: 1,          // render quality scalar (T4 may drop under load)
+    visible: true,
+    size: { w: canvas.width||300, h: canvas.height||300, dpr: Math.min(window.devicePixelRatio||1, 2) },
+    stateVersion: 0,
+  };
+  const target = { mic: 0, tts: 0, energyE: 0 };  // lerp targets for continuous values
+
+  function applyState(patch, version) {
+    // drop stale state updates (Codex: monotonic seq / drop-stale)
+    if (typeof version === 'number' && version < state.stateVersion) return false;
+    if (patch.phase && PHASES.indexOf(patch.phase) >= 0) state.phase = patch.phase;
+    if (patch.audio) { if ('mic' in patch.audio) target.mic = clamp01(patch.audio.mic);
+                       if ('tts' in patch.audio) target.tts = clamp01(patch.audio.tts); }
+    if ('quality' in patch) state.quality = patch.quality;
+    if ('visible' in patch) setVisible(patch.visible);
+    state.stateVersion++;
+    if (statusDot) statusDot.className = (state.phase === 'idle') ? '' : state.phase;
+    return true;
+  }
+
+  // ---- eventQueue (transient one-shots; TTL; never collapse) ----------
+  let eventSeq = 0, lastEventSeq = 0;
+  const queue = [];   // {seq,type,payload,ts,ttl,seed,amp,consumed,born}
+  function pushEvent(type, payload) {
+    const e = {
+      seq: ++eventSeq, type, payload: payload || {},
+      ts: (payload && payload.ts) || 0,
+      ttl: (payload && payload.ttl) || 1.2,        // seconds the transient lives
+      seed: (payload && payload.seed != null) ? payload.seed : pseudoSeed(eventSeq),
+      amp: (payload && payload.amp != null) ? payload.amp : 1.0,
+      consumed: false, born: simTime,
+    };
+    queue.push(e);
+    lastEventSeq = e.seq;
+    return e;
+  }
+  function pruneEvents() {
+    for (let i = queue.length - 1; i >= 0; i--) {
+      if (simTime - queue[i].born > queue[i].ttl) queue.splice(i, 1);
+    }
+  }
+  // deterministic pseudo-random per event index (no Math.random in sim-critical path)
+  function pseudoSeed(n) { const x = Math.sin(n * 12.9898) * 43758.5453; return x - Math.floor(x); }
+
+  // ---- rendererAdapter (STUB in T1; T2 fills with measured JARVIS) ----
+  //   apply(model) — renderer-NEUTRAL inputs only. Owns ALL WebGL + GL-loss + CSS fallback.
+  const rendererAdapter = makeJarvisAdapter(canvas, haloCanvas, fallbackEl);
+
+  // ---- scheduler (T4: adaptive fps / visibility pause / GL-loss guard) -----
+  // Adaptive FPS: idle + low energy → ~5fps (tick only when >=200ms elapsed).
+  // Active (phase≠idle OR energy>=0.05) → full ~60fps.
+  // Visibility: rAF is fully stopped when not visible (no ticks at all).
+  // GL-loss: pause stepping while adapter reports lost; resume when restored.
+  // step(dtMs) is a deterministic bypass — it always ticks immediately (no throttle).
+  const IDLE_THROTTLE_MS = 200;   // 5fps cap when quiet+idle
+  const ENERGY_THRESH    = 0.05;  // below this = "quiet"
+
+  let simTime = 0, frame = 0, rafId = 0, lastWall = 0;
+  let fps = 0, fpsAcc = 0, fpsN = 0;
+  let throttleAcc = 0;   // wall-time accumulator for idle throttle
+  let glContextLost = false;
+  let prevLoud = 0, lastStrike = -1;   // T3: onset detection for strike transients
+
+  // Wire GL-context-loss via adapter hooks (adapter owns GL; scheduler only pauses).
+  // The adapter's onContextLost/onContextRestored already exist (set by the renderer adapter).
+  // We wrap them to also flip our local guard.
+  (function wireGLHooks() {
+    const origLost      = rendererAdapter.onContextLost      ? rendererAdapter.onContextLost.bind(rendererAdapter)      : null;
+    const origRestored  = rendererAdapter.onContextRestored  ? rendererAdapter.onContextRestored.bind(rendererAdapter)  : null;
+    rendererAdapter.onContextLost = function() {
+      glContextLost = true;
+      if (origLost) origLost();
+    };
+    rendererAdapter.onContextRestored = function() {
+      glContextLost = false;
+      if (origRestored) origRestored();
+    };
+  })();
+
+  function tick(dtMs) {
+    const dt = Math.min(dtMs, 50) / 1000;       // clamp + convert to seconds
+    simTime += dt; frame++;
+    // lerp continuous values toward targets
+    state.audio.mic = lerp(state.audio.mic, target.mic, 0.15);
+    state.audio.tts = lerp(state.audio.tts, target.tts, 0.15);
+    // T3: ENERGY follows the louder of mic/tts → morphs calm↔agitated. Fast attack
+    // (talking spikes energy quickly), slow decay (settles back to calm when quiet).
+    const loud = Math.max(state.audio.mic, state.audio.tts);
+    target.energyE = loud;
+    const eRate = loud > state.energyE ? 0.25 : 0.05;   // fast up, slow down
+    state.energyE = lerp(state.energyE, target.energyE, eRate);
+    // T3: STRIKE on a loud rising edge (a syllable) → off-center white-hot impact.
+    const onset = loud - prevLoud; prevLoud = loud;
+    if (onset > 0.10 && (simTime - lastStrike) > 0.12) {
+      lastStrike = simTime;
+      pushEvent('strike', { amp: Math.min(1, onset * 2.5), ttl: 0.45 });
+    }
+    pruneEvents();
+    // Do not call adapter while GL is lost (adapter handles its own CSS fallback).
+    if (!glContextLost) {
+      rendererAdapter.apply({
+        phase: state.phase, audio: state.audio, energy: state.energyE,
+        transients: queue, quality: state.quality, visible: state.visible,
+        size: state.size, time: simTime, dt,
+      });
+    }
+    // fps estimate (rolling 20-sample window)
+    if (dtMs > 0) { fpsAcc += 1000 / dtMs; fpsN++; if (fpsN >= 20) { fps = fpsAcc / fpsN; fpsAcc = 0; fpsN = 0; } }
+  }
+
+  function loop(wall) {
+    rafId = requestAnimationFrame(loop);
+    // Visibility: registered but doing nothing when hidden (rAF re-registers to
+    // avoid needing a separate start path on restore, but skips all work).
+    if (!state.visible) { lastWall = 0; return; }
+    // GL-loss: pause sim advancement; adapter already shows CSS fallback.
+    if (glContextLost) { lastWall = 0; return; }
+
+    const wallDt = lastWall ? (wall - lastWall) : 16;
+    lastWall = wall;
+
+    // ALWAYS animate smoothly while visible. (The old idle-throttle to 5fps made the
+    // orb look FROZEN in its most common state — a face has to stay alive. We only
+    // pause when actually hidden/occluded, which the !state.visible guard above does.)
+    tick(wallDt);
+  }
+
+  function start() {
+    if (!rafId) { lastWall = 0; throttleAcc = 0; rafId = requestAnimationFrame(loop); }
+  }
+  function stop() {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; lastWall = 0; }
+  }
+
+  // ---- lifecycle ------------------------------------------------------
+  function setVisible(v) {
+    v = !!v; state.visible = v;
+    // When becoming visible: restart rAF (no-op if already running).
+    // When hidden: fully stop rAF so no ticks fire.
+    if (v) start(); else stop();
+  }
+  function resize(w, h, dpr) {
+    state.size = { w: w|0, h: h|0, dpr: dpr || state.size.dpr };
+    rendererAdapter.resize(state.size.w, state.size.h, state.size.dpr);
+  }
+  function destroy() {
+    stop();
+    rendererAdapter.destroy();
+  }
+
+  // ---- publicApi inbox: dispatch / setState / setAudio ----------------
+  // msg = {seq, type, payload, ts}.  type in:
+  //   'setState'  -> applyState(payload, payload.version)
+  //   'setAudio'  -> target.mic/tts
+  //   'event'     -> pushEvent(payload.type, payload)   (transient one-shot)
+  //   <known phase or event name> also accepted directly for convenience.
+  function dispatch(msg) {
+    try {
+      if (typeof msg === 'string') msg = JSON.parse(msg);
+    } catch (e) { postToSwift({ type:'error', msg:'bad json: '+e }); return false; }
+    if (!msg || typeof msg !== 'object') { postToSwift({type:'error', msg:'empty dispatch'}); return false; }
+    const seq = msg.seq;
+    let ok = true;
+    switch (msg.type) {
+      case 'setState': ok = applyState(msg.payload || {}, (msg.payload && msg.payload.version)); break;
+      case 'setAudio': if (msg.payload) { if ('mic' in msg.payload) target.mic = clamp01(msg.payload.mic);
+                                          if ('tts' in msg.payload) target.tts = clamp01(msg.payload.tts); } break;
+      case 'event':    pushEvent((msg.payload && msg.payload.type) || 'pulse', msg.payload); break;
+      default:
+        if (PHASES.indexOf(msg.type) >= 0) ok = applyState({ phase: msg.type });
+        else { pushEvent(msg.type, msg.payload); }   // unknown -> treat as transient event
+    }
+    postToSwift({ seq, type: ok ? 'ack' : 'error', msg: ok ? msg.type : ('rejected '+msg.type) });
+    return ok;
+  }
+
+  function setAudio(a) { a = a || {}; if ('mic' in a) target.mic = clamp01(a.mic); if ('tts' in a) target.tts = clamp01(a.tts); }
+  function setState(s) { s = s || {}; if (s.phase) applyState({ phase: s.phase }); if (s.event) pushEvent(s.event, s); }
+  function step(dtMs) { tick(typeof dtMs === 'number' ? dtMs : 16); }   // deterministic; no rAF (T7 verify)
+
+  function debug() {
+    return {
+      stateVersion: state.stateVersion, lastEventSeq,
+      phase: state.phase, audio: { mic: +state.audio.mic.toFixed(3), tts: +state.audio.tts.toFixed(3) },
+      energyE: +state.energyE.toFixed(3), frame, simTime: +simTime.toFixed(3),
+      fps: +fps.toFixed(1), renderer: rendererAdapter.name, glLost: rendererAdapter.glLost(),
+      queueLen: queue.length, adapter: rendererAdapter.debug(),
+    };
+  }
+
+  // boot
+  resize(state.size.w, state.size.h, state.size.dpr);
+  setVisible(opts.visible !== false);
+
+  return { mount: ()=>{}, setAudio, setState, dispatch, step, resize, setVisible, destroy, debug };
+}
+
+// =====================================================================
+//  T2 rendererAdapter — the MEASURED JARVIS look (docs/ORB_DESIGN_REFERENCE.md).
+//  Dense gold filament SHELL (~3 nested radii) + density CORE + Fresnel LIMB +
+//  EMBER particles, on a brown-gold volumetric HAZE, all additive on black.
+//  CHURN not spin (net rotation ~0; differential drift). Per-LINE energy color.
+//  Glow faked = additive accumulation + 1/d² halo sprite + CSS halo behind canvas.
+//  Owns ALL WebGL + GL-context-loss + CSS fallback.  Renderer-neutral apply(model).
+// =====================================================================
+const C_WHITE = new THREE.Color(0xFFF1C0); // white-hot crossings
+const C_HOT   = new THREE.Color(0xFFD27A);
+const C_GOLD  = new THREE.Color(0xFFB020); // mid filaments
+const C_AMBER = new THREE.Color(0xD9701A);
+const C_EMBER = new THREE.Color(0x8A3D05); // dim outer threads
+const C_ALERT = new THREE.Color(0xFF2D2D); // red (error/alert)
+const TWO_PI = Math.PI * 2;
+const GOLD_ANG = Math.PI * (3 - Math.sqrt(5));
+
+// fire ramp by per-line energy e (0 cool .. 1 white-hot)
+const _ra = new THREE.Color(), _rb = new THREE.Color();
+function fireColor(e, out) {
+  e = Number.isFinite(e) ? e : 0;       // Codex: guard NaN
+  e = e < 0 ? 0 : e > 1 ? 1 : e;
+  let a, b, f;
+  if (e < 0.30)      { a = C_EMBER; b = C_AMBER; f = e / 0.30; }
+  else if (e < 0.62) { a = C_AMBER; b = C_GOLD;  f = (e - 0.30) / 0.32; }
+  else if (e < 0.85) { a = C_GOLD;  b = C_HOT;   f = (e - 0.62) / 0.23; }
+  else               { a = C_HOT;   b = C_WHITE; f = (e - 0.85) / 0.15; }
+  return out.copy(a).lerp(b, f);
+}
+
+function makeJarvisAdapter(canvas, haloCanvas, fallbackEl) {
+  let glLost = false;
+  const renderer = new THREE.WebGLRenderer({ canvas, alpha: true, antialias: true });
+  renderer.setClearColor(0x000000, 0); renderer.setClearAlpha(0);
+  window.__rendererOK = true;
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100); camera.position.z = 3.5;
+  const VIEW = new THREE.Vector3(0, 0, 1);
+  const orb = new THREE.Group(); orb.rotation.z = 0.1; scene.add(orb);
+
+  // ---- 1) FILAMENT SHELL: dense gold lines across the sphere, 3 nested radii.
+  //     Each filament = a short great-circle-ish arc between two near points on a
+  //     shell; per-line energy phase → independent hot/cool flicker (measured:
+  //     color is per-line energy, NOT radius). Churn = per-line slow drift, net ~0.
+  // Continuous radius distribution: biased toward outer shell (more coverage there) but filling the volume.
+  // No fixed shells → no concentric-ring banding artifacts.
+  const NTOTAL = 1300;                               // total filament count (dense tangle)
+  const SEG = 6;                                     // segments per arc
+  const fil = [];                                    // {a:Vec3, b:Vec3, mid:Vec3, ephase, espeed, drift, r}
+  // Uniform sphere directions via a low-discrepancy spiral (Fibonacci sphere) so the
+  // FULL sphere is evenly covered — fixes the "empty lower hemisphere" from correlated
+  // hash sampling. Each call advances the spiral; jitter keeps it from looking gridded.
+  let _di = 0;
+  function randDir() {
+    const i = (_di++) % NTOTAL;                       // wrap so reuse (embers/arcs) stays in range
+    const z = 1 - (2 * i + 1) / NTOTAL;              // -1..1 evenly
+    const r = Math.sqrt(Math.max(0, 1 - z*z));
+    const th = i * 2.399963229728653;                // golden angle
+    const jz = (pseudo()-0.5)*0.06, jt = (pseudo()-0.5)*0.3;
+    const zz = Math.max(-1, Math.min(1, z + jz)); const rr = Math.sqrt(Math.max(0,1-zz*zz));
+    return new THREE.Vector3(Math.cos(th+jt)*rr, zz, Math.sin(th+jt)*rr);
+  }
+  let _ps = 1; function pseudo(){ const x=Math.sin(_ps++ * 12.9898)*43758.5453; return x-Math.floor(x); }
+  // Fake SHELL_RADII/PER_SHELL still needed for the NFIL count; use NTOTAL as the loop
+  const SHELL_RADII = [1.0]; const PER_SHELL = [NTOTAL]; // dummy (continuous distribution below)
+  for (let i = 0; i < NTOTAL; i++) {
+    // Sample radius: bias cube-root toward the surface (more filaments = thicker shell)
+    // but keep ~30% inner fill so the interior is not hollow
+    const u = pseudo();
+    // Continuous distribution across whole volume 0.1..1.0, biased toward mid+outer
+    // cube-root-ish: more weight at mid-outer (0.55..1.0) than deep inner
+    const R = u < 0.25 ? 0.10 + pseudo()*0.35    // 25% deep inner (0.10..0.45)
+            : u < 0.55 ? 0.45 + pseudo()*0.30    // 30% mid volume (0.45..0.75)
+            :             0.75 + pseudo()*0.25;   // 45% outer shell (0.75..1.0)
+    const a = randDir();
+    // Arc length scales with depth: deep inner slightly longer; outer short scratches
+    const axis = randDir(); const ang = R < 0.45 ? (0.15 + pseudo()*0.30) : (0.07 + pseudo()*0.18);
+    const b = a.clone().applyAxisAngle(axis, ang);
+    const mid = a.clone().add(b).multiplyScalar(0.5).normalize().multiplyScalar(R * (0.98 + pseudo()*0.06));
+    // inner filaments are hotter (closer to core energy); outer filaments dimmer but limb-bright
+    const innerBias = Math.max(0, (0.75 - R) / 0.55);  // 1 at center, 0 at outer shell
+    fil.push({ a: a.multiplyScalar(R), b: b.multiplyScalar(R), mid,
+               ephase: pseudo()*TWO_PI, espeed: 0.6+pseudo()*1.4,
+               drift: (pseudo()-0.5)*0.5, r: R, bright: 0.5 + innerBias*0.4 + pseudo()*0.3 });
+  }
+  const NFIL = fil.length, VPF = SEG*2;
+  const fpos = new Float32Array(NFIL*VPF*3), fcol = new Float32Array(NFIL*VPF*3);
+  const fgeo = new THREE.BufferGeometry();
+  fgeo.setAttribute('position', new THREE.BufferAttribute(fpos, 3));
+  fgeo.setAttribute('color', new THREE.BufferAttribute(fcol, 3));
+  const fmat = new THREE.LineBasicMaterial({ vertexColors:true, transparent:true, opacity:0.95,
+    blending: THREE.AdditiveBlending, depthWrite:false, depthTest:false });
+  const filaments = new THREE.LineSegments(fgeo, fmat); filaments.frustumCulled = false; orb.add(filaments);
+
+  // ---- 1b) BOLD ORBITAL ARCS: a few bright great-circle bands that stand out
+  //     from the fine mesh (the measured "orange-peel" read). Each arc duplicated
+  //     3x with tiny normal offsets to fake line-width (WebGL ignores linewidth).
+  // FEWER, dimmer, KINKED arcs woven into the mesh (measured ref: NOT clean rings /
+  // "diagram" look — the dense mesh must dominate; arcs are subtle bright accents).
+  const NARC = 3, ARC_SEG = 60, ARC_DUP = 1;  // single-width, fewer segments
+  const arcDefs = [];
+  for (let i = 0; i < NARC; i++) {
+    const axis = randDir();                          // plane normal of this great circle
+    const R = 0.78 + pseudo() * 0.22;                // 0.78..1.0 — varied radii, not all on the rim
+    const u = new THREE.Vector3(1,0,0); if (Math.abs(axis.x) > 0.9) u.set(0,1,0);
+    u.crossVectors(axis, u).normalize(); const v = new THREE.Vector3().crossVectors(axis, u);
+    arcDefs.push({ axis, R, u, v, ephase: pseudo()*TWO_PI, espeed: 0.4+pseudo()*0.7,
+                   kink: 0.10 + pseudo()*0.14, kfreq: 2+Math.floor(pseudo()*4) });  // stronger, varied kink
+  }
+  const ARC_SEGTOT = NARC * ARC_DUP * ARC_SEG;
+  const apos = new Float32Array(ARC_SEGTOT*2*3), acol = new Float32Array(ARC_SEGTOT*2*3);
+  const ageo = new THREE.BufferGeometry();
+  ageo.setAttribute('position', new THREE.BufferAttribute(apos,3));
+  ageo.setAttribute('color', new THREE.BufferAttribute(acol,3));
+  const amat = new THREE.LineBasicMaterial({ vertexColors:true, transparent:true, opacity:0.7,
+    blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false });
+  const arcs = new THREE.LineSegments(ageo, amat); arcs.frustumCulled=false; orb.add(arcs);
+  const _ap = new THREE.Vector3(), _app = new THREE.Vector3(), _ac = new THREE.Color();
+
+  const _qa = new THREE.QuadraticBezierCurve3(new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3());
+  const _sp = new THREE.Vector3(), _spp = new THREE.Vector3(), _wn = new THREE.Vector3();
+  const _lc = new THREE.Color(), _lcp = new THREE.Color();
+
+  // ---- 2) DENSITY CORE: stacked additive sprites → deep-hot center fading out.
+  function glowTex(stops) {
+    const sz=128, cv=document.createElement('canvas'); cv.width=cv.height=sz;
+    const x=cv.getContext('2d'); const g=x.createRadialGradient(sz/2,sz/2,0,sz/2,sz/2,sz/2);
+    for (const [o,c] of stops) g.addColorStop(o,c); x.fillStyle=g; x.fillRect(0,0,sz,sz);
+    return new THREE.CanvasTexture(cv);
+  }
+  const coreTex = glowTex([[0,'rgba(255,245,210,0.95)'],[0.25,'rgba(255,210,122,0.55)'],[0.6,'rgba(217,112,26,0.14)'],[1,'rgba(0,0,0,0)']]);
+  const whiteTex = glowTex([[0,'rgba(255,255,250,1)'],[0.4,'rgba(255,240,200,0.6)'],[1,'rgba(0,0,0,0)']]);
+  const core = new THREE.Sprite(new THREE.SpriteMaterial({ map:coreTex, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, opacity:0.95 }));
+  core.scale.set(0.45,0.45,1); orb.add(core);   // tight hot concentrated core
+  // two concentrated white-gold inner sprites for a hot center
+  const coreInner = [];
+  for (const sc of [0.38, 0.22]) {
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map:whiteTex, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, opacity:0.9 }));
+    sp.scale.set(sc, sc, 1); orb.add(sp); coreInner.push(sp);
+  }
+  // WebGL halo (Codex: more reliable than CSS in transparent overlay) — a big soft sprite behind
+  const halo = new THREE.Sprite(new THREE.SpriteMaterial({ map:coreTex, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, opacity:0.2 }));
+  halo.scale.set(2.4,2.4,1); halo.position.z = -0.2; orb.add(halo);
+
+  // ---- 3) EMBER particles: sparks drifting outward, additive, white-gold.
+  const NEMB = 140; const epos = new Float32Array(NEMB*3); const ecol = new Float32Array(NEMB*3);
+  const emb = []; for (let i=0;i<NEMB;i++){ const d=randDir(); emb.push({ d, r:0.3+pseudo()*0.8, sp:0.2+pseudo()*0.6, ph:pseudo() }); }
+  const egeo = new THREE.BufferGeometry(); egeo.setAttribute('position', new THREE.BufferAttribute(epos,3)); egeo.setAttribute('color', new THREE.BufferAttribute(ecol,3));
+  const emat = new THREE.PointsMaterial({ size:0.03, map:glowTex([[0,'rgba(255,255,255,1)'],[0.4,'rgba(255,210,122,0.7)'],[1,'rgba(0,0,0,0)']]), vertexColors:true, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false, depthTest:false, sizeAttenuation:true });
+  const embers = new THREE.Points(egeo, emat); embers.frustumCulled=false; orb.add(embers);
+
+  // ---- CSS halo (fallback only; primary halo is the WebGL sprite). Codex: size in
+  //     resize(), only clear/fill per frame (no per-frame backing-store realloc).
+  let haloW = 300, haloH = 300;
+  function paintHalo(intensity, alert) {
+    if (!haloCanvas) return;
+    const x = haloCanvas.getContext('2d'); x.clearRect(0,0,haloW,haloH);
+    const g = x.createRadialGradient(haloW/2,haloH/2,0,haloW/2,haloH/2,Math.min(haloW,haloH)*0.5);
+    const A = 0.06 + intensity*0.10;
+    const col = alert>0.3 ? '255,70,60' : '255,176,40';
+    g.addColorStop(0,`rgba(${col},${A})`); g.addColorStop(0.5,`rgba(${col},${A*0.4})`); g.addColorStop(1,'rgba(0,0,0,0)');
+    x.fillStyle=g; x.fillRect(0,0,haloW,haloH);
+  }
+
+  canvas.addEventListener('webglcontextlost', (e)=>{ e.preventDefault(); glLost=true; if(fallbackEl) fallbackEl.classList.add('show'); });
+  canvas.addEventListener('webglcontextrestored', ()=>{ glLost=false; if(fallbackEl) fallbackEl.classList.remove('show'); });
+
+  function resize(w,h,dpr){ renderer.setPixelRatio(Math.min(dpr||1,2)); renderer.setSize(w,h,false); camera.aspect=w/(h||1); camera.updateProjectionMatrix();
+    if (haloCanvas){ haloW = haloCanvas.width = (haloCanvas.clientWidth||w||300); haloH = haloCanvas.height = (haloCanvas.clientHeight||h||300); } }
+
+  let lastIntensity = 0;
+  function apply(model) {
+    if (glLost) return;
+    const t = model.time, E = model.energy || 0, mic = model.audio.mic || 0;
+    const alert = (model.phase === 'error' || model.phase === 'listening') ? (model.phase==='error'?0.9:0.6) : 0;
+    // transient strikes: pick brightest active transient → white-hot impact boost
+    let strike = 0; if (model.transients) for (const ev of model.transients){ const age=t-ev.born; const k=Math.max(0,1-age/(ev.ttl||1.2)); strike=Math.max(strike, k*(ev.amp||1)); }
+    const intensity = Math.min(1.4, 0.45 + E*0.5 + strike*0.5);   // Codex: clamp overdrive
+    lastIntensity = intensity;
+
+    // CHURN (not spin): whole orb barely rotates; gentle wobble only.
+    orb.rotation.y = Math.sin(t*0.05)*0.12;
+    orb.rotation.x = Math.sin(t*0.07)*0.06 + 0.04;
+    orb.updateMatrixWorld();
+
+    // rebuild filaments: bezier arc, per-line energy flicker + limb-brightening + churn drift
+    let o = 0;
+    for (let i=0;i<NFIL;i++){
+      const fl = fil[i];
+      // churn: rotate endpoints slightly about Y by a per-line drift (nets ~0 across lines)
+      const ca = Math.cos(fl.drift*Math.sin(t*0.3+fl.ephase)*0.15), sa = Math.sin(fl.drift*Math.sin(t*0.3+fl.ephase)*0.15);
+      _qa.v0.set(fl.a.x*ca+fl.a.z*sa, fl.a.y, -fl.a.x*sa+fl.a.z*ca);
+      _qa.v2.set(fl.b.x*ca+fl.b.z*sa, fl.b.y, -fl.b.x*sa+fl.b.z*ca);
+      _qa.v1.copy(fl.mid);
+      // per-line energy: independent flicker (4-8Hz-ish) + global intensity + strike
+      const flick = 0.5 + 0.5*Math.sin(t*fl.espeed*4 + fl.ephase);
+      const lineE = Math.min(1, fl.bright*(0.35 + 0.5*flick) + intensity*0.5 + strike*0.4);
+      // limb-brightening: dim where facing camera, hot at silhouette
+      _wn.copy(fl.mid).normalize().applyQuaternion(orb.quaternion);
+      const limb = Math.pow(1 - Math.abs(_wn.dot(VIEW)), 1.0);  // strong limb brightening for bright rim
+      // Also boost inner-volume filaments so the center isn't hollow
+      const innerGlow = Math.pow(Math.max(0, 0.75 - fl.r), 1.2) * 3.0;
+      const lum = (0.50 + limb*1.6 + innerGlow) * (0.65 + intensity*0.9);
+      fireColor(lineE, _lc);
+      if (alert>0) _lc.lerp(C_ALERT, alert*0.7);
+      _lc.multiplyScalar(lum);
+      let first=true;
+      for (let s=0;s<=SEG;s++){
+        _qa.getPoint(s/SEG, _sp);
+        // crossings/tips blow white: brighten near endpoints
+        if (first){ _spp.copy(_sp); _lcp.copy(_lc); first=false; continue; }
+        fpos[o]=_spp.x; fpos[o+1]=_spp.y; fpos[o+2]=_spp.z; fcol[o]=_lcp.r; fcol[o+1]=_lcp.g; fcol[o+2]=_lcp.b; o+=3;
+        fpos[o]=_sp.x;  fpos[o+1]=_sp.y;  fpos[o+2]=_sp.z;  fcol[o]=_lc.r;  fcol[o+1]=_lc.g;  fcol[o+2]=_lc.b;  o+=3;
+        _spp.copy(_sp); _lcp.copy(_lc);
+      }
+    }
+    fgeo.getAttribute('position').needsUpdate = true; fgeo.getAttribute('color').needsUpdate = true;
+
+    // BOLD ARCS: bright great-circle bands, 2.5-3x mesh brightness, 3 offset dupes for width.
+    let ao = 0;
+    for (let i=0;i<NARC;i++){
+      const ad = arcDefs[i];
+      const aflick = 0.7 + 0.3*Math.sin(t*ad.espeed*2 + ad.ephase);
+      fireColor(Math.min(1, 0.62 + intensity*0.3), _ac);
+      if (alert>0) _ac.lerp(C_ALERT, alert*0.6);
+      const aLum = (0.60 + intensity*0.25) * aflick;     // arcs barely brighter than mesh, not dominant
+      _ac.multiplyScalar(aLum);
+      for (let d=0; d<ARC_DUP; d++){
+        const off = (d-0.5)*0.006;                     // tiny radial offset → faux width
+        let first=true;
+        for (let s=0;s<=ARC_SEG;s++){
+          const a = (s/ARC_SEG)*TWO_PI;
+          const rr = ad.R + off + ad.kink*Math.sin(a*ad.kfreq + ad.ephase);  // wavy, woven
+          _ap.set(ad.u.x*Math.cos(a)*rr + ad.v.x*Math.sin(a)*rr,
+                  ad.u.y*Math.cos(a)*rr + ad.v.y*Math.sin(a)*rr,
+                  ad.u.z*Math.cos(a)*rr + ad.v.z*Math.sin(a)*rr);
+          if (first){ _app.copy(_ap); first=false; continue; }
+          apos[ao]=_app.x; apos[ao+1]=_app.y; apos[ao+2]=_app.z; acol[ao]=_ac.r; acol[ao+1]=_ac.g; acol[ao+2]=_ac.b; ao+=3;
+          apos[ao]=_ap.x;  apos[ao+1]=_ap.y;  apos[ao+2]=_ap.z;  acol[ao]=_ac.r; acol[ao+1]=_ac.g; acol[ao+2]=_ac.b; ao+=3;
+          _app.copy(_ap);
+        }
+      }
+    }
+    ageo.getAttribute('position').needsUpdate=true; ageo.getAttribute('color').needsUpdate=true;
+
+    // core GLOW HUB (verifier: needs a real glowing hub, not a dot) — bigger soft core
+    const breathe = 1 + 0.06*Math.sin(t*1.25) + mic*0.12 + strike*0.25;
+    core.scale.set(0.78*breathe, 0.78*breathe, 1);
+    core.material.opacity = Math.min(1, 0.85 + intensity*0.4);
+    for (let i=0;i<coreInner.length;i++){ const base=[0.40,0.24][i]; coreInner[i].scale.set(base*breathe, base*breathe, 1);
+      coreInner[i].material.opacity = Math.min(1, 0.8 + intensity*0.4 + strike*0.3); }
+    halo.material.opacity = Math.min(0.4, 0.18 + intensity*0.2);
+
+    // embers drift outward, reseed via TTL phase; whiter with strike
+    for (let i=0;i<NEMB;i++){ const e=emb[i]; const ph=(t*e.sp + e.ph)%1; const r=e.r*(1+ph*0.5); const ix=i*3;
+      epos[ix]=e.d.x*r; epos[ix+1]=e.d.y*r; epos[ix+2]=e.d.z*r;
+      fireColor(0.7+strike*0.3, _lc); const fade=(1-ph); _lc.multiplyScalar(fade*(0.4+intensity*0.7));
+      ecol[ix]=_lc.r; ecol[ix+1]=_lc.g; ecol[ix+2]=_lc.b; }
+    egeo.getAttribute('position').needsUpdate=true; egeo.getAttribute('color').needsUpdate=true;
+
+    paintHalo(intensity, alert);
+    renderer.render(scene, camera);
+  }
+  return {
+    name: 'jarvis-v1', apply, resize,
+    glLost: () => glLost,
+    onContextLost: () => { glLost = true; if (fallbackEl) fallbackEl.classList.add('show'); },
+    onContextRestored: () => { glLost = false; if (fallbackEl) fallbackEl.classList.remove('show'); },
+    debug: () => ({ kind:'jarvis-v1', filaments: NFIL, arcs: NARC, embers: NEMB, intensity:+lastIntensity.toFixed(3), glLost }),
+    destroy: () => { try { renderer.dispose(); } catch(e){} },
+  };
+}
+
+// ===== helpers =======================================================
+function clamp01(v) { v = Number(v); return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0; }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// =====================================================================
+//  publicApi — default overlay instance + global hooks + back-compat shims
+// =====================================================================
+try {
+  const orbCanvas = document.getElementById('orb');
+  const haloCanvas = document.getElementById('halo');
+  const statusDot = document.getElementById('status-dot');
+  const fallbackEl = document.getElementById('fallback');
+
+  function fit() {
+    const w = window.innerWidth, h = window.innerHeight, dpr = Math.min(window.devicePixelRatio || 1, 2);
+    orbCanvas.width = w * dpr; orbCanvas.height = h * dpr;
+    return { w, h, dpr };
+  }
+  const f0 = fit();
+
+  const __orb = createOrb(orbCanvas, {
+    halo: haloCanvas, statusDot, fallback: fallbackEl, visible: true,
+  });
+  __orb.resize(f0.w, f0.h, f0.dpr);
+
+  window.__orb = __orb;
+  window.createOrb = createOrb;                       // for T6 (drawer instance)
+  window.__orbDispatch = (msg) => __orb.dispatch(msg);
+  window.__diag = () => __orb.debug();                // legacy diag name
+
+  // back-compat shims (Swift WebViewOrbManager still calls these today)
+  window.setOrbPhase  = (p) => __orb.setState({ phase: p });
+  window.setAudioLevel = (v) => __orb.setAudio({ mic: Number(v) });
+
+  window.addEventListener('resize', () => { const f = fit(); __orb.resize(f.w, f.h, f.dpr); });
+} catch (err) {
+  window.__orbError = String(err);
+  try { if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.orb)
+        window.webkit.messageHandlers.orb.postMessage({ type:'error', msg:'boot: '+String(err) }); } catch(e){}
+}
+
+})();
+</script>
+</body>
+</html>

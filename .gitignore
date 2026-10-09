@@ -1,0 +1,10 @@
+.buildbuild/
+.DS_Store
+.env
+*.dmg
+*.swp
+build/
+
+# Reference repos for orb study (kept locally, not pushed — large)
+vendor-refs/
+docs/orb-video/
