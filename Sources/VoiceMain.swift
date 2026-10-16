@@ -5,7 +5,14 @@ import SwiftUI
 enum VoiceMain {
     @MainActor
     static func main() {
-        if CommandLine.arguments.contains("--demo") {
+        if let flag = CommandLine.arguments.firstIndex(of: "--demo-export") {
+            guard CommandLine.arguments.indices.contains(flag + 1) else {
+                fputs("Use --demo-export followed by a new output directory.\n", stderr)
+                exit(1)
+            }
+            do { try VoiceDemo.export(to: URL(fileURLWithPath: CommandLine.arguments[flag + 1], isDirectory: true)) }
+            catch { fputs("Offline demo export failed; the destination must be new and writable.\n", stderr); exit(1) }
+        } else if CommandLine.arguments.contains("--demo") {
             VoiceDemo.run()
         } else {
             FreeFlowApp.main()
@@ -15,6 +22,30 @@ enum VoiceMain {
 
 // This entry path never constructs AppDelegate or AppState, reads settings or starts a recorder.
 enum VoiceDemo {
+    @MainActor
+    static func export(to directory: URL) throws {
+        guard !FileManager.default.fileExists(atPath: directory.path) else { throw CocoaError(.fileWriteFileExists) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let application = NSApplication.shared
+        application.setActivationPolicy(.prohibited)
+        for example in 0..<4 {
+            let frame = NSRect(x: 0, y: 0, width: 680, height: 460)
+            let window = NSWindow(contentRect: frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            let view = NSHostingView(rootView: VoiceDemoView(example: example))
+            window.contentView = view
+            view.frame = frame
+            view.layoutSubtreeIfNeeded()
+            window.displayIfNeeded()
+            guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { throw CocoaError(.fileWriteUnknown) }
+            view.cacheDisplay(in: view.bounds, to: bitmap)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else { throw CocoaError(.fileWriteUnknown) }
+            try data.write(to: directory.appendingPathComponent("example-\(example).png"), options: .withoutOverwriting)
+        }
+        let receipt = ["schema": 1, "synthetic": true, "frames": 4, "pointWidth": 680, "pointHeight": 460, "microphone": false, "network": false, "savedHistory": false] as [String: Any]
+        try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys]).write(to: directory.appendingPathComponent("demo.json"), options: .withoutOverwriting)
+        print("Exported four synthetic offline demo frames.")
+    }
+
     @MainActor
     static func run() {
         let application = NSApplication.shared
@@ -32,7 +63,8 @@ enum VoiceDemo {
 }
 
 private struct VoiceDemoView: View {
-    @State private var example = 0
+    @State private var example: Int
+    init(example: Int = 0) { _example = State(initialValue: example) }
     private let samples = [
         ("Ready to try", "Choose an example to see a synthetic dictation. This demo uses no microphone, network, saved history or app context."),
         ("Dictation", "Please move the planning meeting to Thursday at ten and share the updated agenda."),

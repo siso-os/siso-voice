@@ -51,7 +51,7 @@ Run the built app with `--demo` to try synthetic dictation and cleanup examples:
 "build/SISO Voice.app/Contents/MacOS/SISO Voice" --demo
 ```
 
-This entry path does not start the normal application state, recorder, provider requests, saved history or app-context reader. It needs no API key or microphone permission.
+This entry path does not start the normal application state, recorder, provider requests, saved history or app-context reader. It needs no API key or microphone permission. For screenshots without displaying a window, pass `--demo-export /absolute/path/to/new-directory`; it exports four labelled synthetic examples and a receipt.
 
 ## Use it
 
