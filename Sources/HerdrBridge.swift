@@ -1,22 +1,13 @@
 import Foundation
 
-/// HerdrBridge — drives the live herdr instance from the SISO Voice app to talk to JARVIS.
-///
-/// JARVIS lives as two panes in the "JARVIS" herdr workspace: an Opus coordinator (the one Shaan
-/// talks to) and a Codex worker, both booted from `~/SISO_Workspace/.agents/jarvis`. This bridge
-/// resolves the Opus pane fresh every call (pane ids renumber when panes close — never cache one),
-/// types a message into it, and reads the reply back.
-///
-/// IMPORTANT: use the REAL herdr binary at ~/.local/bin/herdr. The /opt/homebrew/bin/cmux binary
-/// talks to a different/stale socket and cannot see the live workspaces. (Learned the hard way.)
-/// The app is not sandboxed and already shells out via Process(), so this is fine.
+/// Optional local terminal bridge. Target identities are configured by the user.
 enum HerdrBridge {
 
     static let herdrPath = "\(NSHomeDirectory())/.local/bin/herdr"
-    static let jarvisWorkspaceId = "w6536f558caca12"
-    static let jarvisHomeMarker = ".agents/jarvis"
-    static let jarvisWorkspaceLabel = "JARVIS"
-    static let jarvisOpusPaneLabel = "JARVIS-OPUS"
+    static let jarvisWorkspaceId = ProcessInfo.processInfo.environment["SISO_AGENT_WORKSPACE_ID"] ?? ""
+    static let jarvisHomeMarker = ProcessInfo.processInfo.environment["SISO_AGENT_HOME_MARKER"] ?? "/AgentBridge"
+    static let jarvisWorkspaceLabel = ProcessInfo.processInfo.environment["SISO_AGENT_WORKSPACE_LABEL"] ?? "Agent"
+    static let jarvisOpusPaneLabel = ProcessInfo.processInfo.environment["SISO_AGENT_PANE_LABEL"] ?? "Agent"
 
     enum BridgeError: Error, CustomStringConvertible {
         case bridgeDisabled

@@ -43,6 +43,16 @@ You need macOS 13 or later, the Xcode command line tools (`xcode-select --instal
    This builds `SISO Voice.app`, puts it in `/Applications` and starts it at login.
 3. **Set it up:** open SISO Voice, paste your Groq key, and allow the microphone and accessibility when macOS asks.
 
+## Offline demo
+
+Run the built app with `--demo` to try synthetic dictation and cleanup examples:
+
+```bash
+"build/SISO Voice.app/Contents/MacOS/SISO Voice" --demo
+```
+
+This entry path does not start the normal application state, recorder, provider requests, saved history or app-context reader. It needs no API key or microphone permission.
+
 ## Use it
 
 - Hold `Fn` and talk; let go and the text is pasted into the field you are in.
@@ -65,3 +75,8 @@ you configure.
 ## Licence
 
 MIT, as FreeFlow. See [LICENSE](LICENSE).
+### Release artifacts
+
+Maintainers build a universal, Developer ID signed and notarized archive with `bash build-release.sh X.Y.Z`, using `SISO_VOICE_SIGNING_IDENTITY` and an existing `SISO_VOICE_NOTARY_PROFILE` in their keychain. Publish `SISO-Voice-macos-universal.zip` and `SHA256SUMS` together on the matching `vX.Y.Z` GitHub release. `bash install-release.sh` verifies the checksum, bundle identity and Apple notarization before replacing an installation. It refuses to replace a running app. No notarized release is supplied by these source changes.
+
+For artifact inspection with the stable local development certificate, `SISO_VOICE_RELEASE_CANDIDATE=1 bash build-release.sh X.Y.Z` creates a local candidate. A local candidate is not a public release and the public installer rejects it.

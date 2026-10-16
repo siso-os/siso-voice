@@ -41,7 +41,11 @@ launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 for _ in $(seq 1 50); do pgrep -x "SISO Voice" >/dev/null || break; sleep 0.1; done
 
 mkdir -p "$HOME/Applications"
-rm -rf "$DEST"
+if [ -e "$DEST" ]; then
+  ARCHIVE="$HOME/Library/Application Support/SISO Voice/_archive/apps"
+  mkdir -p "$ARCHIVE"
+  mv "$DEST" "$ARCHIVE/SISO Voice-$(date +%Y%m%dT%H%M%S).app"
+fi
 ditto "$BUILT" "$DEST"
 launchctl bootstrap "$DOMAIN" "$PLIST"
 

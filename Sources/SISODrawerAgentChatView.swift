@@ -71,7 +71,7 @@ final class SISODrawerAgentChatView: NSView {
 
         // (1) All saved conversation files, oldest→newest (not just the newest — fixes the date-roll
         // empty where a new day has no file yet).
-        let dir = "\(NSHomeDirectory())/SISO_Workspace/.agents/jarvis/memory/conversations"
+        let dir = "\(TranscriptRouter.jarvisHome)/memory/conversations"
         let logs = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [])
             .filter { $0.hasSuffix(".md") }.sorted()
         var shown = 0
@@ -237,7 +237,7 @@ final class SISODrawerAgentChatView: NSView {
         jarvisQueue.async { [weak self] in
             guard let self else { return }
             // Write a timestamped inbox file (the shared-brain drop-box, agent-zero style).
-            let home = "\(NSHomeDirectory())/SISO_Workspace/.agents/jarvis/inbox"
+            let home = "\(TranscriptRouter.jarvisHome)/inbox"
             let fmt = ISO8601DateFormatter()
             fmt.formatOptions = [.withYear, .withMonth, .withDay, .withTime]
             let stamp = fmt.string(from: Date()).replacingOccurrences(of: ":", with: "")

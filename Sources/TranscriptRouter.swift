@@ -12,9 +12,9 @@ enum TranscriptRouter {
         false
     }
 
-    static let jarvisHome = "\(NSHomeDirectory())/SISO_Workspace/.agents/jarvis"
+    static let jarvisHome = ProcessInfo.processInfo.environment["SISO_AGENT_HOME"] ?? "\(NSHomeDirectory())/Library/Application Support/SISO Voice/AgentBridge"
     static let jarvisSessionTranscriptPath =
-        "\(NSHomeDirectory())/.claude/projects/-Users-shaansisodia-SISO-Workspace--agents-jarvis/5c6479d5-6b39-4a3b-b890-a35d7850ceff.jsonl"
+        ProcessInfo.processInfo.environment["SISO_AGENT_SESSION_TRANSCRIPT"] ?? "\(jarvisHome)/session.jsonl"
     private static let jarvisReplyTimeout: TimeInterval = 300
     private static let jarvisReplyPollInterval: TimeInterval = 0.5
 
