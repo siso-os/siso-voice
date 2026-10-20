@@ -78,6 +78,7 @@ struct HomeSettingsView: View {
                 microphoneGroup
                 transcriptionGroup
                 keybindingsGroup
+                VoicePersonalizationView()
                 systemGroup
             }
             .padding(SISOTheme.Metrics.s6)

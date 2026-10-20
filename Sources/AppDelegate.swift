@@ -41,6 +41,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NetworkMonitor.shared.start()
         if isLoginUnregisterMode {
             try? SMAppService.mainApp.unregister()
             for application in NSRunningApplication.runningApplications(withBundleIdentifier: "com.siso.voice")
@@ -157,7 +158,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NotificationCenter.default.addObserver(
                 forName: TranscriptRouter.didSendToJarvis, object: nil, queue: .main
             ) { [weak self] _ in
-                self?.edgeDock.openDock(tab: .jarvis)
+                Task { @MainActor in self?.edgeDock.openDock(tab: .jarvis) }
             }
             NotificationCenter.default.addObserver(
                 self, selector: #selector(handleToggleSidebar),
@@ -216,14 +217,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 object: window,
                 queue: .main
             ) { [weak self] _ in
-                guard let self = self else { return }
-                if !self.appState.hasCompletedSetup {
-                    self.appState.hasCompletedSetup = true
-                    self.appState.startHotkeyMonitoring()
-                    self.appState.startAccessibilityPolling()
-                    NSApp.setActivationPolicy(.regular) // SISO Voice: stay a Dock app, don't drop to menubar-only
+                MainActor.assumeIsolated {
+                    guard let self = self else { return }
+                    if !self.appState.hasCompletedSetup {
+                        self.appState.hasCompletedSetup = true
+                        self.appState.startHotkeyMonitoring()
+                        self.appState.startAccessibilityPolling()
+                        NSApp.setActivationPolicy(.regular) // SISO Voice: stay a Dock app, don't drop to menubar-only
+                    }
+                    self.setupWindow = nil
                 }
-                self.setupWindow = nil
             }
         }
     }
@@ -270,10 +273,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: window,
             queue: .main
         ) { [weak self] _ in
-            if self?.setupWindow == nil && self?.settingsWindow == nil {
-                NSApp.setActivationPolicy(.regular) // SISO Voice: stay a Dock app, don't drop to menubar-only
+            MainActor.assumeIsolated {
+                if self?.setupWindow == nil && self?.settingsWindow == nil {
+                    NSApp.setActivationPolicy(.regular) // SISO Voice: stay a Dock app, don't drop to menubar-only
+                }
+                self?.mainWindow = nil
             }
-            self?.mainWindow = nil
         }
     }
 
@@ -319,10 +324,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             object: window,
             queue: .main
         ) { [weak self] _ in
-            if self?.setupWindow == nil {
-                NSApp.setActivationPolicy(.regular) // SISO Voice: stay a Dock app, don't drop to menubar-only
+            MainActor.assumeIsolated {
+                if self?.setupWindow == nil {
+                    NSApp.setActivationPolicy(.regular) // SISO Voice: stay a Dock app, don't drop to menubar-only
+                }
+                self?.settingsWindow = nil
             }
-            self?.settingsWindow = nil
         }
     }
 

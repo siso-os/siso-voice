@@ -13,6 +13,13 @@
 import SwiftUI
 import AppKit
 
+extension Notification.Name {
+    static let sisoTeachCorrection = Notification.Name("sisoTeachCorrection")
+    static let sisoUndoLearnedCorrection = Notification.Name("sisoUndoLearnedCorrection")
+    static let sisoReprocessHistory = Notification.Name("sisoReprocessHistory")
+    static let sisoSendHistoryToAgent = Notification.Name("sisoSendHistoryToAgent")
+}
+
 /// Notification posted by the re-use action; `object` is the transcript string.
 /// The app observes this to paste the text. Defined here (single source) and
 /// referenced by the page.
@@ -155,6 +162,8 @@ struct MainWindowHistoryRow: View {
     @State private var didCopy = false
     @State private var expanded = false
     @State private var hovering = false
+    @State private var showingCorrection = false
+    @State private var showingTeachUndo = false
 
     private var text: String { HistoryText.display(item) }
     private var transcriptMeta: String {
@@ -183,7 +192,7 @@ struct MainWindowHistoryRow: View {
                         .foregroundColor(SISOTheme.Colors.textMuted)
                 }
                 // Transcript
-                Text(text)
+                comparisonText
                     .sisoText(.body, color: SISOTheme.Colors.textPrimary)
                     .lineLimit(expanded ? nil : 2)
                     .fixedSize(horizontal: false, vertical: expanded)
@@ -204,6 +213,32 @@ struct MainWindowHistoryRow: View {
                 HistoryIconButton(systemName: "arrow.uturn.left",
                                   help: "Re-use",
                                   action: reuse)
+                Menu {
+                    Button("Copy raw transcript") { copy(item.rawTranscript) }
+                    Button("Reuse raw transcript") { reuse(item.rawTranscript) }
+                    Divider()
+                    Button("Teach correction…") { showingCorrection = true }
+                    Button("Undo learned correction") { showingTeachUndo = true }
+                    Menu("Reprocess as…") {
+                        ForEach(["verbatim", "message", "email", "code", "agent"], id: \.self) { mode in
+                            Button(mode.capitalized) {
+                                NotificationCenter.default.post(name: .sisoReprocessHistory,
+                                    object: nil, userInfo: ["id": item.id, "mode": mode])
+                            }
+                        }
+                    }
+                    Button("Send to agent…") {
+                        NotificationCenter.default.post(name: .sisoSendHistoryToAgent,
+                                                         object: text)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(SISOTheme.Colors.textMuted)
+                        .padding(SISOTheme.Metrics.s2)
+                }
+                .menuStyle(.borderlessButton)
+                .help("More history actions")
                 if item.audioFileName != nil {
                     HistoryRetryButton(
                         isRetrying: isRetrying,
@@ -228,24 +263,115 @@ struct MainWindowHistoryRow: View {
         .animation(.easeInOut(duration: 0.12), value: hovering)
         .animation(.easeInOut(duration: 0.12), value: isSelected)
         .onHover { hovering = $0 }
+        .sheet(isPresented: $showingCorrection) {
+            HistoryCorrectionSheet(original: item.rawTranscript,
+                                   corrected: text) { original, corrected in
+                NotificationCenter.default.post(name: .sisoTeachCorrection,
+                    object: nil, userInfo: ["original": original, "corrected": corrected])
+                showingCorrection = false
+                showingTeachUndo = true
+            }
+        }
+        .alert("Correction learned", isPresented: $showingTeachUndo) {
+            Button("Undo", role: .destructive) {
+                NotificationCenter.default.post(name: .sisoUndoLearnedCorrection, object: nil)
+            }
+            Button("Done", role: .cancel) { }
+        } message: { Text("The correction was sent to SISO Voice.") }
+    }
+
+    private var comparisonText: Text {
+        let raw = item.rawTranscript
+        guard !raw.isEmpty, !item.postProcessedTranscript.isEmpty, raw != item.postProcessedTranscript else {
+            return Text(text)
+        }
+        return Self.diff(raw: raw, cleaned: item.postProcessedTranscript)
+    }
+
+    private static func diff(raw: String, cleaned: String) -> Text {
+        let old = raw.split(whereSeparator: \.isWhitespace).map(String.init)
+        let new = cleaned.split(whereSeparator: \.isWhitespace).map(String.init)
+        let rows = old.count + 1, cols = new.count + 1
+        // Keep long takes cheap to render; the full versions remain selectable.
+        guard old.count <= 400, new.count <= 400 else {
+            return Text(raw).strikethrough().foregroundColor(SISOTheme.Colors.destructive)
+                + Text("\n" + cleaned).foregroundColor(SISOTheme.Colors.accent)
+        }
+        var lcs = Array(repeating: Array(repeating: 0, count: cols), count: rows)
+        if !old.isEmpty && !new.isEmpty {
+            for i in stride(from: old.count - 1, through: 0, by: -1) {
+                for j in stride(from: new.count - 1, through: 0, by: -1) {
+                    lcs[i][j] = old[i] == new[j] ? 1 + lcs[i + 1][j + 1] : max(lcs[i + 1][j], lcs[i][j + 1])
+                }
+            }
+        }
+        var i = 0, j = 0
+        var result = Text("")
+        while i < old.count || j < new.count {
+            if i < old.count && j < new.count && old[i] == new[j] {
+                result = result + Text(old[i] + " ")
+                i += 1; j += 1
+            } else if i < old.count && (j == new.count || lcs[i + 1][j] >= lcs[i][j + 1]) {
+                result = result + Text(old[i] + " ").strikethrough().foregroundColor(SISOTheme.Colors.destructive)
+                i += 1
+            } else {
+                result = result + Text(new[j] + " ").foregroundColor(SISOTheme.Colors.accent).underline()
+                j += 1
+            }
+        }
+        return result
     }
 
     // MARK: Actions
 
     func copy() {
+        copy(text)
+    }
+
+    func reuse() {
+        reuse(text)
+    }
+
+    private func copy(_ value: String) {
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        NSPasteboard.general.setString(value, forType: .string)
         didCopy = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { didCopy = false }
     }
 
-    func reuse() {
-        copy()
-        NotificationCenter.default.post(name: .sisoReuseTranscript, object: text)
+    private func reuse(_ value: String) {
+        copy(value)
+        NotificationCenter.default.post(name: .sisoReuseTranscript, object: value)
     }
 
     private static func formatDuration(_ duration: Double) -> String {
         let totalSeconds = max(0, Int(duration.rounded()))
         return "\(totalSeconds / 60):\(String(format: "%02d", totalSeconds % 60))"
+    }
+}
+
+private struct HistoryCorrectionSheet: View {
+    @State var original: String
+    @State var corrected: String
+    let onTeach: (String, String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: SISOTheme.Metrics.s3) {
+            Text("Teach a correction").font(SISOTheme.font(.sectionHeading))
+            Text("Original").sisoText(.caption, color: SISOTheme.Colors.textMuted)
+            TextEditor(text: $original).frame(minHeight: 90).sisoCard()
+            Text("Corrected").sisoText(.caption, color: SISOTheme.Colors.textMuted)
+            TextEditor(text: $corrected).frame(minHeight: 90).sisoCard()
+            HStack {
+                Button("Cancel") { dismiss() }
+                Spacer()
+                Button("Teach") { onTeach(original, corrected) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || corrected.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(SISOTheme.Metrics.s6)
+        .frame(width: 440)
     }
 }

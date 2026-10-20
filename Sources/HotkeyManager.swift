@@ -10,6 +10,8 @@ final class HotkeyManager {
 
     var onShortcutEvent: ((ShortcutEvent) -> Void)?
     var onEscapeKeyPressed: (() -> Bool)?
+    var onUndoDictation: (() -> Void)?
+    private var undoKeyDown = false
 
     var currentPressedModifiers: ShortcutModifiers {
         inputState.currentModifiers
@@ -43,6 +45,7 @@ final class HotkeyManager {
         backend.onInputEvent = nil
         backend.onEscapeKeyPressed = nil
         inputState = ShortcutInputState()
+        undoKeyDown = false
     }
 
     deinit {
@@ -50,6 +53,20 @@ final class HotkeyManager {
     }
 
     private func handleInputEvent(_ event: ShortcutInputEvent) -> ShortcutConsumeDecision {
+        if case .keyChanged(let keyCode, let isDown, let isRepeat) = event, keyCode == 6 {
+            if undoKeyDown {
+                if !isDown { undoKeyDown = false }
+                return .consume
+            }
+            let reservedByConfiguration = [configuration.hold, configuration.toggle, configuration.copyAgain].contains {
+                $0.kind == .key && $0.keyCode == keyCode && $0.modifiers == [.command, .option]
+            }
+            if isDown, !isRepeat, !reservedByConfiguration, inputState.currentModifiers == [.command, .option] {
+                undoKeyDown = true
+                onUndoDictation?()
+                return .consume
+            }
+        }
         let result = ShortcutMatcher.reduce(
             state: inputState,
             event: event,

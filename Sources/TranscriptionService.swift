@@ -3,12 +3,67 @@ import os.log
 
 private let transcriptionLog = OSLog(subsystem: "com.zachlatta.freeflow", category: "Transcription")
 
+struct ValidatedAPIConfiguration: Equatable, Sendable {
+    let apiKey: String
+    let baseURL: String
+    let transcriptionAPIURL: String
+    let transcriptionAPIKey: String
+}
+
+enum APIConfigurationSaveFlow {
+    static let defaultBaseURL = "https://api.groq.com/openai/v1"
+
+    @MainActor
+    static func validateAndApply(
+        apiKey: String,
+        baseURL: String,
+        transcriptionAPIURL: String,
+        transcriptionAPIKey: String,
+        validator: @escaping @Sendable (String, String) async -> Bool = { key, url in
+            await TranscriptionService.validateAPIKey(key, baseURL: url)
+        },
+        apply: (ValidatedAPIConfiguration) -> Void
+    ) async -> Bool {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedBaseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedBaseURL = trimmedBaseURL.isEmpty ? defaultBaseURL : trimmedBaseURL
+        let trimmedTranscriptionURL = transcriptionAPIURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedTranscriptionKey = transcriptionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveTranscriptionURL = trimmedTranscriptionURL.isEmpty ? resolvedBaseURL : trimmedTranscriptionURL
+        let effectiveTranscriptionKey = trimmedTranscriptionKey.isEmpty ? key : trimmedTranscriptionKey
+        guard await validator(key, resolvedBaseURL) else { return false }
+        if effectiveTranscriptionURL != resolvedBaseURL || effectiveTranscriptionKey != key {
+            guard await validator(effectiveTranscriptionKey, effectiveTranscriptionURL) else { return false }
+        }
+        apply(ValidatedAPIConfiguration(
+            apiKey: key,
+            baseURL: resolvedBaseURL,
+            transcriptionAPIURL: trimmedTranscriptionURL,
+            transcriptionAPIKey: trimmedTranscriptionKey
+        ))
+        return true
+    }
+}
+
 class TranscriptionService {
+    private static let modelsSupportingVerboseJSON: Set<String> = [
+        // OpenAI's Whisper model supports segment metadata. The newer
+        // gpt-4o-transcribe family only supports the plain JSON format.
+        "whisper-1",
+        // Groq's hosted Whisper models support verbose_json and expose the
+        // segment metadata used by the hallucination filter below.
+        "whisper-large-v3",
+        "whisper-large-v3-turbo"
+    ]
+
     private let apiKey: String
     private let baseURL: URL
     private let transcriptionModel: String
     private let language: String?
-    private let transcriptionResponseFormat = "verbose_json"
+    private let vocabularyPrompt: String
+    private var transcriptionResponseFormat: String {
+        Self.responseFormat(forModel: transcriptionModel)
+    }
     private let maxTranscriptionAttempts = 3
     private let transcriptionRetryBackoffs: [TimeInterval] = [2, 5]
     private var transcriptionTimeoutSeconds: TimeInterval {
@@ -25,7 +80,8 @@ class TranscriptionService {
         apiKey: String,
         baseURL: String = "https://api.groq.com/openai/v1",
         transcriptionModel: String = "whisper-large-v3",
-        language: String? = nil
+        language: String? = nil,
+        vocabularyPrompt: String = ""
     ) throws {
         self.apiKey = apiKey
         self.baseURL = try Self.normalizedBaseURL(from: baseURL)
@@ -33,10 +89,22 @@ class TranscriptionService {
         self.transcriptionModel = trimmedModel.isEmpty ? "whisper-large-v3" : trimmedModel
         let trimmedLanguage = language?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.language = (trimmedLanguage?.isEmpty == false) ? trimmedLanguage : nil
+        self.vocabularyPrompt = String(vocabularyPrompt.prefix(2000))
+    }
+
+    static func responseFormat(forModel model: String) -> String {
+        let normalizedModel = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return modelsSupportingVerboseJSON.contains(normalizedModel) ? "verbose_json" : "json"
     }
 
     // Validate API key by hitting a lightweight endpoint
-    static func validateAPIKey(_ key: String, baseURL: String = "https://api.groq.com/openai/v1") async -> Bool {
+    static func validateAPIKey(
+        _ key: String,
+        baseURL: String = "https://api.groq.com/openai/v1",
+        transport: @escaping @Sendable (URLRequest) async throws -> (Data, URLResponse) = { request in
+            try await LLMAPITransport.data(for: request)
+        }
+    ) async -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         guard let baseURL = try? normalizedBaseURL(from: baseURL) else { return false }
@@ -46,7 +114,7 @@ class TranscriptionService {
         request.setValue("Bearer \(trimmed)", forHTTPHeaderField: "Authorization")
 
         do {
-            let (_, response) = try await LLMAPITransport.data(for: request)
+            let (_, response) = try await transport(request)
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             return status == 200
         } catch {
@@ -60,10 +128,42 @@ class TranscriptionService {
             throw CancellationError()
         }
 
-        do {
-            return try await transcribeAudio(fileURL: fileURL)
-        } catch let urlError as URLError where urlError.code == .timedOut {
-            throw TranscriptionError.transcriptionTimedOut(transcriptionTimeoutSeconds)
+        let timeoutSeconds = transcriptionTimeoutSeconds
+        let raceState = TranscriptionTimeoutRaceState()
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                raceState.setContinuation(continuation)
+
+                let transcriptionTask = Task { [weak self] in
+                    do {
+                        guard let self else {
+                            throw TranscriptionError.transcriptionFailed("Transcription service deallocated")
+                        }
+                        let result = try await self.transcribeAudio(fileURL: fileURL)
+                        raceState.finish(.success(result))
+                    } catch {
+                        raceState.finish(.failure(Self.transcriptionTimeoutErrorIfNeeded(
+                            error,
+                            timeoutSeconds: timeoutSeconds
+                        )))
+                    }
+                }
+
+                let timeoutTask = Task {
+                    do {
+                        try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                        raceState.finish(.failure(TranscriptionError.transcriptionTimedOut(timeoutSeconds)))
+                    } catch is CancellationError {
+                    } catch {
+                        raceState.finish(.failure(error))
+                    }
+                }
+
+                raceState.setTasks([transcriptionTask, timeoutTask])
+            }
+        } onCancel: {
+            raceState.cancel()
         }
     }
 
@@ -285,6 +385,12 @@ class TranscriptionService {
             try appendMultipartString("Content-Disposition: form-data; name=\"response_format\"\r\n\r\n", to: output)
             try appendMultipartString("\(responseFormat)\r\n", to: output)
 
+            if !vocabularyPrompt.isEmpty {
+                try appendMultipartString("--\(boundary)\r\n", to: output)
+                try appendMultipartString("Content-Disposition: form-data; name=\"prompt\"\r\n\r\n", to: output)
+                try appendMultipartString("\(vocabularyPrompt)\r\n", to: output)
+            }
+
             if let language, !language.isEmpty {
                 try appendMultipartString("--\(boundary)\r\n", to: output)
                 try appendMultipartString("Content-Disposition: form-data; name=\"language\"\r\n\r\n", to: output)
@@ -336,6 +442,8 @@ class TranscriptionService {
             return "Endpoint not found at \(provider) (HTTP 404). Base URL is likely wrong for this provider."
         case 413:
             return "Audio file too large for \(provider) (HTTP 413). Try a shorter recording."
+        case 400:
+            return "Provider rejected the request (HTTP 400). Check your model name and Base URL in Settings."
         case 429:
             return "Rate limit reached at \(provider) (HTTP 429). Wait a moment and try again."
         case 500..<600:
@@ -343,6 +451,16 @@ class TranscriptionService {
         default:
             return "Request failed at \(provider) (HTTP \(status))."
         }
+    }
+
+    private static func transcriptionTimeoutErrorIfNeeded(
+        _ error: Error,
+        timeoutSeconds: TimeInterval
+    ) -> Error {
+        if let urlError = error as? URLError, urlError.code == .timedOut {
+            return TranscriptionError.transcriptionTimedOut(timeoutSeconds)
+        }
+        return error
     }
 
     private static func normalizedBaseURL(from baseURL: String) throws -> URL {
@@ -382,13 +500,8 @@ class TranscriptionService {
     }
 
     // Whisper-large-v3 hallucinates common short phrases on silence/background
-    // noise. Drop them when whisper itself reports a high no_speech_prob.
-    // Add a new (phrase, minNoSpeechProb) pair here to filter more hallucinations.
-    //
-    // Thresholds tuned on ~500 samples from quiet and noisy environments, including
-    // both positive cases (real "thank you" speech) and empty-audio cases. Kept
-    // conservative to minimize false positives (filtering real user speech).
-    // Normal speech included audios have very low no_speech_prob.
+    // noise. Drop them when whisper itself reports a high no_speech_prob (tuned
+    // on ~500 quiet and noisy samples; kept conservative so real speech is safe).
     private let hallucinationPhrases = [
         "thank you",
         "thank you for watching",
@@ -476,6 +589,65 @@ enum TranscriptionError: LocalizedError {
         case .pollFailed(let msg): return "Polling failed: \(msg)"
         case .audioPreparationFailed(let msg): return "Audio preparation failed: \(msg)"
         }
+    }
+}
+
+private final class TranscriptionTimeoutRaceState {
+    private let lock = NSLock()
+    private var didFinish = false
+    private var continuation: CheckedContinuation<String, Error>?
+    private var tasks: [Task<Void, Never>] = []
+
+    func setContinuation(_ continuation: CheckedContinuation<String, Error>) {
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func setTasks(_ tasks: [Task<Void, Never>]) {
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            tasks.forEach { $0.cancel() }
+            return
+        }
+
+        self.tasks = tasks
+        lock.unlock()
+    }
+
+    func finish(_ result: Result<String, Error>) {
+        lock.lock()
+        guard !didFinish else {
+            lock.unlock()
+            return
+        }
+
+        didFinish = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let tasks = self.tasks
+        self.tasks = []
+        lock.unlock()
+
+        tasks.forEach { $0.cancel() }
+
+        switch result {
+        case .success(let value):
+            continuation?.resume(returning: value)
+        case .failure(let error):
+            continuation?.resume(throwing: error)
+        }
+    }
+
+    func cancel() {
+        finish(.failure(CancellationError()))
     }
 }
 
