@@ -457,7 +457,11 @@ final class VoiceHUDContainerView: NSView {
         case .error:
             borderColor = NSColor(srgbRed: 1.0, green: 0.35, blue: 0.42, alpha: 0.32)
         }
-        borderLayer.strokeColor = borderColor.cgColor
+        let skin = VoiceHUDSkin(rawValue: UserDefaults.standard.string(forKey: VoiceHUDSkin.preferenceKey) ?? "") ?? .classic
+        let accent: NSColor? = phase == .error ? nil : (skin == .gold
+            ? NSColor(srgbRed: 0.93, green: 0.73, blue: 0.29, alpha: 0.55)
+            : skin == .midnight ? NSColor(srgbRed: 0.32, green: 0.50, blue: 0.95, alpha: 0.55) : nil)
+        borderLayer.strokeColor = (accent ?? borderColor).cgColor
 
         let isIdle = phase == .idle
         materialView.alphaValue = 0.76
@@ -467,6 +471,7 @@ final class VoiceHUDContainerView: NSView {
             blue: 0.055,
             alpha: isIdle ? 0.52 : 0.68
         ).cgColor
+        if let accent { tintView.layer?.backgroundColor = accent.withAlphaComponent(0.12).cgColor }
         updateRecordingControlAvailability()
     }
 

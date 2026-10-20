@@ -20,7 +20,7 @@ import AppKit
 enum ShareCardExport {
 
     /// Fixed render width of the exported ticket (matches on-screen ticket).
-    static let renderWidth: CGFloat = 720
+    nonisolated static let renderWidth: CGFloat = 720
 
     // MARK: - PNG render (ImageRenderer @2x)
 
@@ -75,6 +75,14 @@ enum ShareCardExport {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(summaryText(stats, name: name), forType: .string)
+    }
+
+    /// Copy a history-earned milestone for sharing. The caller supplies only
+    /// achievements derived from the user's actual pipeline history.
+    static func copyAchievement(_ achievement: VoiceAchievement) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(achievement.shareText, forType: .string)
     }
 
     // MARK: - Save (Downloads)

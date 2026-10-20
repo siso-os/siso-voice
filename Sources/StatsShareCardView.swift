@@ -41,6 +41,9 @@ struct StatsShareCardView: View {
                     ShareCardTicket(stats: stats)
                         .frame(maxWidth: 720)
 
+                    VoiceProgressView(history: history)
+                        .frame(maxWidth: 720)
+
                     actionBar
 
                     if let url = savedURL {

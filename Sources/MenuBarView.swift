@@ -120,6 +120,12 @@ struct MenuBarView: View {
             Divider()
 
             // Manual toggle
+            Button("Paste Last Dictation") { appState.copyLastTranscriptToPasteboard() }
+                .disabled(appState.lastTranscript.isEmpty || appState.isRecording || appState.isTranscribing)
+            Button("Undo Last Dictation (⌘⌥Z)") { appState.undoLastVoiceInsertion() }
+                .disabled(appState.isRecording || appState.isTranscribing)
+            Button("Undo Last Learned Correction") { appState.undoVoiceLearning() }
+            Divider()
             Button(appState.isRecording ? "Stop Recording" : "Start Dictating") {
                 appState.toggleRecording()
             }
@@ -182,6 +188,14 @@ struct MenuBarView: View {
 
                 Button("Open Run Log") {
                     openRunLog()
+                }
+            }
+
+            Divider()
+
+            Button("Paste Custom Word to Vocabulary") {
+                if appState.pasteWordToVocabulary() != nil {
+                    VocabularyNotificationManager.shared.flashCheckmark()
                 }
             }
 

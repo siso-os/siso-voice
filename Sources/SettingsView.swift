@@ -56,14 +56,16 @@ struct ProviderSettingsFields: View {
     @State private var postProcessingModelDraft: String = ""
     @State private var postProcessingFallbackModelDraft: String = ""
     @State private var contextModelDraft: String = ""
+    /// Updated by the cooldown timer so warning labels clear at expiry without user interaction.
+    @State private var now: Date = Date()
+    /// Tracks whether the Settings window is the frontmost active window.
+    @Environment(\.controlActiveState) private var controlActiveState
 
     let showsModelDescription: Bool
 
     private func commitAPIBaseURL() {
         let trimmed = apiBaseURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        let resolvedBaseURL = trimmed.isEmpty ? AppState.defaultAPIBaseURL : trimmed
-        apiBaseURLInput = resolvedBaseURL
-        appState.apiBaseURL = resolvedBaseURL
+        apiBaseURLInput = trimmed.isEmpty ? AppState.defaultAPIBaseURL : trimmed
     }
 
     private func commitTranscriptionModel() {
@@ -94,6 +96,37 @@ struct ProviderSettingsFields: View {
         appState.postProcessingFallbackModel = trimmed
     }
 
+    /// True when this view's hosting window is the frontmost key window. While true a 5s timer
+    /// advances `now`, so a daily-limit warning appears within ~5s of being written and clears
+    /// within ~5s of expiry. SwiftUI removes the timer when this view leaves the hierarchy
+    /// (switching tabs or dismissing the Setup sheet). The timer must NOT be gated on a warning
+    /// already being visible: nothing else observes the UserDefaults cooldown keys, so a freshly
+    /// written cooldown would otherwise never trigger a re-render. Cost is negligible.
+    private var shouldRunCooldownTimer: Bool {
+        controlActiveState == .key
+    }
+
+    /// Reads the persisted daily-limit expiry date for a model directly from UserDefaults.
+    /// Uses the shared key from LLMCooldownManager to avoid duplicating the storage contract.
+    /// Returns nil if no daily limit is active or if the entry has already expired.
+    private func dailyCooldownExpiry(for model: String) -> Date? {
+        let key = LLMCooldownManager.udKey(for: model)
+        let timestamp = UserDefaults.standard.double(forKey: key)
+        guard timestamp > 0 else { return nil }
+        let date = Date(timeIntervalSince1970: timestamp)
+        return date > now ? date : nil
+    }
+
+    /// Formats a cooldown reset time, including the date only when the reset falls on a later day,
+    /// so a daily limit that resets after midnight is not shown as an ambiguous bare time.
+    private func formattedCooldownReset(_ expiry: Date) -> String {
+        // Calendar.isDate(_:inSameDayAs:) is a macOS-native calendar-aware same-day comparison.
+        if Calendar.current.isDate(expiry, inSameDayAs: now) {
+            return expiry.formatted(date: .omitted, time: .shortened)
+        }
+        return expiry.formatted(date: .abbreviated, time: .shortened)
+    }
+
     private func commitContextModel() {
         let trimmed = contextModelDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         contextModelDraft = trimmed
@@ -102,17 +135,11 @@ struct ProviderSettingsFields: View {
     }
 
     private func commitTranscriptionAPIURL() {
-        let trimmed = transcriptionAPIURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        transcriptionAPIURLInput = trimmed
-        guard appState.transcriptionAPIURL != trimmed else { return }
-        appState.transcriptionAPIURL = trimmed
+        transcriptionAPIURLInput = transcriptionAPIURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func commitTranscriptionAPIKey() {
-        let trimmed = transcriptionAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        transcriptionAPIKeyInput = trimmed
-        guard appState.transcriptionAPIKey != trimmed else { return }
-        appState.transcriptionAPIKey = trimmed
+        transcriptionAPIKeyInput = transcriptionAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     var body: some View {
@@ -140,7 +167,6 @@ struct ProviderSettingsFields: View {
 
                 Button("Reset to Default") {
                     apiBaseURLInput = AppState.defaultAPIBaseURL
-                    appState.apiBaseURL = AppState.defaultAPIBaseURL
                 }
                 .font(.caption)
             }
@@ -177,57 +203,55 @@ struct ProviderSettingsFields: View {
                     .foregroundStyle(.secondary)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Post-Processing Fallback Model")
-                    .font(.caption.weight(.semibold))
-                HStack(spacing: 8) {
-                    TextField(AppState.defaultPostProcessingFallbackModel, text: $postProcessingFallbackModelDraft)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($isEditingPostProcessingFallbackModel)
-                        .onSubmit {
-                            commitPostProcessingFallbackModel()
-                        }
-                        .onChange(of: isEditingPostProcessingFallbackModel) { isEditing in
-                            if !isEditing {
-                                commitPostProcessingFallbackModel()
-                            }
-                        }
-                    Button("Reset to Default") {
-                        postProcessingFallbackModelDraft = AppState.defaultPostProcessingFallbackModel
-                        appState.postProcessingFallbackModel = AppState.defaultPostProcessingFallbackModel
-                    }
-                    .font(.caption)
+            // Shows when this model has hit its daily Groq rate limit.
+            // Disappears automatically once the limit window resets.
+            if let expiry = dailyCooldownExpiry(for: appState.postProcessingModel) {
+                Label {
+                    Text("Daily limit reached — resets at \(formattedCooldownReset(expiry))")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
                 }
-                Text("Used as the explicit retry model for transcript cleanup and Edit Mode transforms.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Context Model")
-                    .font(.caption.weight(.semibold))
-                HStack(spacing: 8) {
-                    TextField(AppState.defaultContextModel, text: $contextModelDraft)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($isEditingContextModel)
-                        .onSubmit {
-                            commitContextModel()
-                        }
-                        .onChange(of: isEditingContextModel) { isEditing in
-                            if !isEditing {
-                                commitContextModel()
-                            }
-                        }
-                    Button("Reset to Default") {
-                        contextModelDraft = AppState.defaultContextModel
-                        appState.contextModel = AppState.defaultContextModel
-                    }
-                    .font(.caption)
+            ModelDropdownView(
+                title: "Post-Processing Fallback Model",
+                subtitle: "Used as the explicit retry model for transcript cleanup and Edit Mode transforms.",
+                predefinedModels: ModelConfiguration.llmModels,
+                defaultModel: AppState.defaultPostProcessingFallbackModel,
+                textDraft: $postProcessingFallbackModelDraft,
+                onCommit: commitPostProcessingFallbackModel,
+                onReset: {
+                    postProcessingFallbackModelDraft = AppState.defaultPostProcessingFallbackModel
+                    appState.postProcessingFallbackModel = AppState.defaultPostProcessingFallbackModel
                 }
-                Text("Used for context inference, with a text-only retry when screenshot analysis fails.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+            )
+
+            // Shows when the fallback model has also hit its daily limit.
+            // In this state, both models are unavailable until their limits reset.
+            if let expiry = dailyCooldownExpiry(for: appState.postProcessingFallbackModel) {
+                Label {
+                    Text("Fallback daily limit reached — resets at \(formattedCooldownReset(expiry))")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                }
+                .font(.caption)
+                .foregroundStyle(.orange)
             }
+
+            ModelDropdownView(
+                title: "Context Model",
+                subtitle: "Used for context inference, with a text-only retry when screenshot analysis fails. Screenshot analysis requires a model that accepts image input.",
+                predefinedModels: ModelConfiguration.visionModels,
+                defaultModel: AppState.defaultContextModel,
+                textDraft: $contextModelDraft,
+                onCommit: commitContextModel,
+                onReset: {
+                    contextModelDraft = AppState.defaultContextModel
+                    appState.contextModel = AppState.defaultContextModel
+                }
+            )
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Transcription Model")
@@ -289,7 +313,6 @@ struct ProviderSettingsFields: View {
                     if !transcriptionAPIURLInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Button("Clear") {
                             transcriptionAPIURLInput = ""
-                            appState.transcriptionAPIURL = ""
                         }
                         .font(.caption)
                     }
@@ -315,7 +338,6 @@ struct ProviderSettingsFields: View {
                     if !transcriptionAPIKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         Button("Clear") {
                             transcriptionAPIKeyInput = ""
-                            appState.transcriptionAPIKey = ""
                         }
                         .font(.caption)
                     }
@@ -391,6 +413,15 @@ struct ProviderSettingsFields: View {
             if !isEditingContextModel {
                 contextModelDraft = value
             }
+        }
+        // Tick every 5s while this view's window is key so a daily-limit warning can appear and
+        // auto-clear without any external state change. SwiftUI removes this timer when the
+        // window is backgrounded or this view leaves the hierarchy (tab switch or sheet dismissal).
+        if shouldRunCooldownTimer {
+            Color.clear.frame(width: 0, height: 0)
+                .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { value in
+                    now = value
+                }
         }
     }
 }
@@ -519,15 +550,13 @@ struct GeneralSettingsView: View {
     @AppStorage("overlay_display_id") private var overlayDisplayID = 0
     @AppStorage("use_compact_overlay") private var useCompactOverlay = false
     @State private var screensVersion = 0
-    @State private var apiKeyInput: String = ""
-    @State private var apiBaseURLInput: String = ""
-    @State private var transcriptionAPIURLInput: String = ""
-    @State private var transcriptionAPIKeyInput: String = ""
+    @State private var apiDraft = APIConfigurationDraft()
     @State private var advancedProviderSettingsExpanded = false
     @State private var isValidatingKey = false
     @State private var keyValidationError: String?
-    @State private var keyValidationSuccess = false
+    @State private var successfulAPIConfiguration: ValidatedAPIConfiguration?
     @State private var customVocabularyInput: String = ""
+    @FocusState private var customVocabularyFocused: Bool
     @State private var micPermissionGranted = false
     @State private var showMutedHint = false
     @State private var copiedBuildInfo = false
@@ -715,6 +744,9 @@ struct GeneralSettingsView: View {
                 SettingsCard("Edit Mode", icon: "pencil") {
                     commandModeSection
                 }
+                SettingsCard("Cleanup", icon: "sparkles") {
+                    cleanupSection
+                }
                 SettingsCard("Clipboard", icon: "doc.on.clipboard") {
                     clipboardSection
                 }
@@ -737,23 +769,30 @@ struct GeneralSettingsView: View {
             .padding(24)
         }
         .onAppear {
-            apiKeyInput = appState.apiKey
-            apiBaseURLInput = appState.apiBaseURL
-            transcriptionAPIURLInput = appState.transcriptionAPIURL
-            transcriptionAPIKeyInput = appState.transcriptionAPIKey
+            apiDraft.present(appState.committedAPIConfiguration)
+            isValidatingKey = false
+            keyValidationError = nil
+            successfulAPIConfiguration = nil
             customVocabularyInput = appState.customVocabulary
             checkMicPermission()
             appState.refreshLaunchAtLoginStatus()
             Task { await githubCache.fetchIfNeeded() }
         }
-        .onChange(of: appState.transcriptionAPIURL) { value in
-            if transcriptionAPIURLInput != value {
-                transcriptionAPIURLInput = value
+        .onDisappear {
+            apiDraft.dismiss()
+            commitCustomVocabulary()
+        }
+        .onChange(of: appState.committedAPIConfiguration) { saved in
+            apiDraft.reconcile(saved)
+            keyValidationError = nil
+            if successfulAPIConfiguration != saved {
+                successfulAPIConfiguration = nil
             }
         }
-        .onChange(of: appState.transcriptionAPIKey) { value in
-            if transcriptionAPIKeyInput != value {
-                transcriptionAPIKeyInput = value
+        .onChange(of: apiDraft.configuration) { value in
+            keyValidationError = nil
+            if successfulAPIConfiguration != value {
+                successfulAPIConfiguration = nil
             }
         }
     }
@@ -959,26 +998,22 @@ struct GeneralSettingsView: View {
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 8) {
-                SecureField("Enter your Groq API key", text: $apiKeyInput)
+                SecureField("Enter your Groq API key", text: $apiDraft.apiKey)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(.body, design: .monospaced))
                     .disabled(isValidatingKey)
-                    .onChange(of: apiKeyInput) { _ in
-                        keyValidationError = nil
-                        keyValidationSuccess = false
-                    }
 
                 Button(isValidatingKey ? "Validating..." : "Save") {
                     validateAndSaveKey()
                 }
-                .disabled(apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isValidatingKey)
+                .disabled(apiDraft.apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isValidatingKey)
             }
 
             if let error = keyValidationError {
                 Label(error, systemImage: "xmark.circle.fill")
                     .foregroundStyle(.red)
                     .font(.caption)
-            } else if keyValidationSuccess {
+            } else if apiDraft.showsSavedSuccess(successfulAPIConfiguration, committed: appState.committedAPIConfiguration) {
                 Label("API key saved", systemImage: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                     .font(.caption)
@@ -988,9 +1023,9 @@ struct GeneralSettingsView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     Divider()
                     ProviderSettingsFields(
-                        apiBaseURLInput: $apiBaseURLInput,
-                        transcriptionAPIURLInput: $transcriptionAPIURLInput,
-                        transcriptionAPIKeyInput: $transcriptionAPIKeyInput,
+                        apiBaseURLInput: $apiDraft.baseURL,
+                        transcriptionAPIURLInput: $apiDraft.transcriptionAPIURL,
+                        transcriptionAPIKeyInput: $apiDraft.transcriptionAPIKey,
                         showsModelDescription: false
                     )
                 }
@@ -1009,25 +1044,37 @@ struct GeneralSettingsView: View {
     }
 
     private func validateAndSaveKey() {
-        let key = apiKeyInput.trimmingCharacters(in: .whitespacesAndNewlines)
-        let baseURL = apiBaseURLInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isValidatingKey else { return }
+        let submission = apiDraft.submission
         isValidatingKey = true
         keyValidationError = nil
-        keyValidationSuccess = false
+        successfulAPIConfiguration = nil
 
-        Task {
-            let valid = await TranscriptionService.validateAPIKey(
-                key,
-                baseURL: baseURL.isEmpty ? AppState.defaultAPIBaseURL : baseURL
-            )
-            await MainActor.run {
-                isValidatingKey = false
-                if valid {
-                    appState.apiKey = key
-                    keyValidationSuccess = true
-                } else {
-                    keyValidationError = "Validation failed. Please check your API key and provider settings, then try again."
+        Task { @MainActor in
+            var accepted: ValidatedAPIConfiguration?
+            let valid = await APIConfigurationSaveFlow.validateAndApply(
+                apiKey: submission.configuration.apiKey,
+                baseURL: submission.configuration.baseURL,
+                transcriptionAPIURL: submission.configuration.transcriptionAPIURL,
+                transcriptionAPIKey: submission.configuration.transcriptionAPIKey
+            ) { configuration in
+                if apiDraft.accept(configuration, for: submission) {
+                    accepted = configuration
                 }
+                appState.updateAPIConfiguration(
+                    apiKey: configuration.apiKey,
+                    baseURL: configuration.baseURL,
+                    transcriptionAPIURL: configuration.transcriptionAPIURL,
+                    transcriptionAPIKey: configuration.transcriptionAPIKey
+                )
+            }
+            guard apiDraft.isCurrent(submission) else { return }
+            isValidatingKey = false
+            if valid, let accepted, apiDraft.configuration == accepted,
+               appState.committedAPIConfiguration == accepted {
+                successfulAPIConfiguration = accepted
+            } else if !valid && apiDraft.matches(submission) {
+                keyValidationError = "Validation failed. Please check your API key and provider settings, then try again."
             }
         }
     }
@@ -1239,6 +1286,22 @@ struct GeneralSettingsView: View {
         }
     }
 
+    // MARK: Cleanup
+
+    private var cleanupSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Preserve exact wording", isOn: $appState.preserveExactWording)
+
+            Text("When on, \(AppName.displayName) skips the LLM cleanup step and pastes the transcript verbatim — filler words, informal phrasing, and explicit language are all preserved. Voice macros and Edit Mode still run.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text("If Output Language is set, the transcript is still translated into that language, but the translation is literal: no rewording, no filler removal, no reformatting.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     // MARK: Clipboard
 
     private var clipboardSection: some View {
@@ -1246,6 +1309,15 @@ struct GeneralSettingsView: View {
             Toggle("Preserve clipboard after paste", isOn: $appState.preserveClipboard)
 
             Text("\(AppName.displayName) will temporarily place the transcript on your clipboard to paste it, then restore whatever was there before. If you copy something else before the restore happens, \(AppName.displayName) leaves it alone.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Divider()
+                .padding(.vertical, 2)
+
+            Toggle("Keep dictations in clipboard history", isOn: $appState.keepDictationInClipboardHistory)
+
+            Text("When on, your clipboard manager (Paste, Raycast, Maccy, etc.) records each dictation so you can find it in your recent history. When off, \(AppName.displayName) marks dictations transient and your clipboard manager skips them.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
 
@@ -1341,6 +1413,13 @@ struct GeneralSettingsView: View {
 
     // MARK: Custom Vocabulary
 
+    private func commitCustomVocabulary() {
+        let trimmed = customVocabularyInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if appState.customVocabulary != trimmed {
+            appState.customVocabulary = trimmed
+        }
+    }
+
     private var vocabularySection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Words and phrases to preserve during post-processing.")
@@ -1350,12 +1429,13 @@ struct GeneralSettingsView: View {
             TextEditor(text: $customVocabularyInput)
                 .font(.system(.body, design: .monospaced))
                 .frame(minHeight: 80, maxHeight: 140)
+                .focused($customVocabularyFocused)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
-                .onChange(of: customVocabularyInput) { newValue in
-                    appState.customVocabulary = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                .onChange(of: customVocabularyFocused) { focused in
+                    if !focused { commitCustomVocabulary() }
                 }
 
             Text("Separate entries with commas, new lines, or semicolons.")
@@ -1464,6 +1544,8 @@ struct PromptsSettingsView: View {
     @EnvironmentObject var appState: AppState
     @State private var customSystemPromptInput: String = ""
     @State private var customContextPromptInput: String = ""
+    @FocusState private var customSystemPromptFocused: Bool
+    @FocusState private var customContextPromptFocused: Bool
     @State private var showDefaultSystemPrompt = false
     @State private var showDefaultContextPrompt = false
 
@@ -1486,6 +1568,9 @@ struct PromptsSettingsView: View {
                 SettingsCard("System Prompt", icon: "text.bubble.fill") {
                     systemPromptSection
                 }
+                SettingsCard("Instruction Guard", icon: "shield.lefthalf.filled") {
+                    instructionGuardSection
+                }
                 SettingsCard("Context Prompt", icon: "eye.fill") {
                     contextPromptSection
                 }
@@ -1499,6 +1584,38 @@ struct PromptsSettingsView: View {
             customContextPromptInput = appState.customContextPrompt.isEmpty
                 ? AppContextService.defaultContextPrompt
                 : appState.customContextPrompt
+        }
+        .onDisappear {
+            commitCustomSystemPrompt()
+            commitCustomContextPrompt()
+        }
+    }
+
+    private func commitCustomSystemPrompt() {
+        let trimmed = customSystemPromptInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultTrimmed = PostProcessingService.defaultSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == defaultTrimmed || trimmed.isEmpty {
+            if !appState.customSystemPrompt.isEmpty {
+                appState.customSystemPrompt = ""
+                appState.customSystemPromptLastModified = ""
+            }
+        } else if appState.customSystemPrompt != trimmed {
+            appState.customSystemPrompt = trimmed
+            appState.customSystemPromptLastModified = iso8601DayFormatter.string(from: Date())
+        }
+    }
+
+    private func commitCustomContextPrompt() {
+        let trimmed = customContextPromptInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        let defaultTrimmed = AppContextService.defaultContextPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == defaultTrimmed || trimmed.isEmpty {
+            if !appState.customContextPrompt.isEmpty {
+                appState.customContextPrompt = ""
+                appState.customContextPromptLastModified = ""
+            }
+        } else if appState.customContextPrompt != trimmed {
+            appState.customContextPrompt = trimmed
+            appState.customContextPromptLastModified = iso8601DayFormatter.string(from: Date())
         }
     }
 
@@ -1562,25 +1679,13 @@ struct PromptsSettingsView: View {
             TextEditor(text: $customSystemPromptInput)
                 .font(.system(.body, design: .monospaced))
                 .frame(minHeight: 120, maxHeight: 200)
+                .focused($customSystemPromptFocused)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
-                .onChange(of: customSystemPromptInput) { newValue in
-                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let defaultTrimmed = PostProcessingService.defaultSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed == defaultTrimmed || trimmed.isEmpty {
-                        if !appState.customSystemPrompt.isEmpty {
-                            appState.customSystemPrompt = ""
-                            appState.customSystemPromptLastModified = ""
-                        }
-                    } else {
-                        appState.customSystemPrompt = trimmed
-                        let today = iso8601DayFormatter.string(from: Date())
-                        if appState.customSystemPromptLastModified != today {
-                            appState.customSystemPromptLastModified = today
-                        }
-                    }
+                .onChange(of: customSystemPromptFocused) { focused in
+                    if !focused { commitCustomSystemPrompt() }
                 }
 
             HStack {
@@ -1678,7 +1783,22 @@ struct PromptsSettingsView: View {
         }
     }
 
+    private var instructionGuardSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle(
+                "Prevent dictated prompts from being executed",
+                isOn: $appState.instructionExecutionGuardEnabled
+            )
+            .toggleStyle(.switch)
+
+            Text("When enabled, FreeFlow retries or falls back to the literal transcript if post-processing looks like it answered the dictated text instead of cleaning it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
     private func runSystemPromptTest() {
+        commitCustomSystemPrompt()
         systemTestRunning = true
         systemTestOutput = nil
         systemTestError = nil
@@ -1688,7 +1808,8 @@ struct PromptsSettingsView: View {
             apiKey: appState.apiKey,
             baseURL: PostProcessingService.resolvedPostProcessingBaseURL(),
             preferredModel: appState.postProcessingModel,
-            preferredFallbackModel: appState.postProcessingFallbackModel
+            preferredFallbackModel: appState.postProcessingFallbackModel,
+            instructionExecutionGuardEnabled: appState.instructionExecutionGuardEnabled
         )
         let input = systemTestInput
         let customPrompt = appState.customSystemPrompt
@@ -1789,25 +1910,13 @@ struct PromptsSettingsView: View {
             TextEditor(text: $customContextPromptInput)
                 .font(.system(.body, design: .monospaced))
                 .frame(minHeight: 120, maxHeight: 200)
+                .focused($customContextPromptFocused)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
                         .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                 )
-                .onChange(of: customContextPromptInput) { newValue in
-                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let defaultTrimmed = AppContextService.defaultContextPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if trimmed == defaultTrimmed || trimmed.isEmpty {
-                        if !appState.customContextPrompt.isEmpty {
-                            appState.customContextPrompt = ""
-                            appState.customContextPromptLastModified = ""
-                        }
-                    } else {
-                        appState.customContextPrompt = trimmed
-                        let today = iso8601DayFormatter.string(from: Date())
-                        if appState.customContextPromptLastModified != today {
-                            appState.customContextPromptLastModified = today
-                        }
-                    }
+                .onChange(of: customContextPromptFocused) { focused in
+                    if !focused { commitCustomContextPrompt() }
                 }
 
             HStack {
@@ -1868,6 +1977,15 @@ struct PromptsSettingsView: View {
                         .font(.caption)
                     }
                 }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle("Allow full-desktop screenshot fallback", isOn: $appState.desktopScreenshotFallbackEnabled)
+                Text("When active-window capture fails, FreeFlow can capture the full desktop, including other apps, and send it to your configured context provider. Turn this off to continue without a screenshot when active-window capture fails. Applies to new context captures.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Divider()
@@ -1937,6 +2055,7 @@ struct PromptsSettingsView: View {
     }
 
     private func runContextPromptTest() {
+        commitCustomContextPrompt()
         contextTestRunning = true
         contextTestOutput = nil
         contextTestError = nil
@@ -1951,7 +2070,7 @@ struct PromptsSettingsView: View {
                     contextTestOutput = context.contextSummary
                     contextTestPrompt = prompt
                 } else {
-                    contextTestError = "Context inference returned no result. This may be a permissions issue or the API could not be reached."
+                    contextTestError = context.contextSummary
                     contextTestOutput = context.contextSummary
                 }
                 contextTestRunning = false
@@ -2236,10 +2355,23 @@ struct RunLogEntryView: View {
                                     }
 
                                     if !item.contextSummary.isEmpty {
-                                        Text(item.contextSummary)
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                            .textSelection(.enabled)
+                                        if ContextInferenceFailure.isFailureSummary(item.contextSummary) {
+                                            Label("Context summary failed", systemImage: "exclamationmark.triangle.fill")
+                                                .font(.caption.weight(.semibold))
+                                                .foregroundStyle(.orange)
+                                            Text(item.contextSummary)
+                                                .font(.caption)
+                                                .foregroundStyle(.orange)
+                                                .textSelection(.enabled)
+                                            Text("No usable activity summary. Dictation can continue.")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        } else {
+                                            Text(item.contextSummary)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                                .textSelection(.enabled)
+                                        }
                                     } else {
                                         Text("No context captured")
                                             .font(.caption)

@@ -82,7 +82,9 @@ final class EdgeDockController: NSObject {
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main
-        ) { [weak self] _ in self?.repositionBar() }
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.repositionBar() }
+        }
     }
 
     /// Tear down (e.g. when toggle is disabled at runtime).

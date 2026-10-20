@@ -205,6 +205,8 @@ private enum SessionIntent {
 }
 
 final class AppState: ObservableObject, @unchecked Sendable {
+    private var lastLearnedRuleID: UUID?
+    private var lastLearnedTermID: UUID?
     private enum ActiveAudioInterruption {
         case muted(previouslyMuted: Bool)
     }
@@ -228,11 +230,14 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private let selectedMicrophoneStorageKey = "selected_microphone_id"
     private let customSystemPromptStorageKey = "custom_system_prompt"
     private let customContextPromptStorageKey = "custom_context_prompt"
+    private let instructionExecutionGuardEnabledStorageKey = "instruction_execution_guard_enabled"
     private let customSystemPromptLastModifiedStorageKey = "custom_system_prompt_last_modified"
     private let customContextPromptLastModifiedStorageKey = "custom_context_prompt_last_modified"
     private let contextScreenshotMaxDimensionStorageKey = "context_screenshot_max_dimension"
     private let shortcutStartDelayStorageKey = "shortcut_start_delay"
     private let preserveClipboardStorageKey = "preserve_clipboard"
+    private let preserveExactWordingStorageKey = "preserve_exact_wording"
+    private let keepDictationInClipboardHistoryStorageKey = "keep_dictation_in_clipboard_history"
     private let pressEnterVoiceCommandStorageKey = "press_enter_voice_command_enabled"
     private let alertSoundsEnabledStorageKey = "alert_sounds_enabled"
     private let soundVolumeStorageKey = "sound_volume"
@@ -285,9 +290,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
         ("hu", "Hungarian"),
         ("ca", "Catalan")
     ]
-    static let defaultPostProcessingModel = PostProcessingService.defaultPostProcessingModel
-    static let defaultPostProcessingFallbackModel = "meta-llama/llama-4-scout-17b-16e-instruct"
-    static let defaultContextModel = "meta-llama/llama-4-scout-17b-16e-instruct"
+    static let defaultPostProcessingModel = "openai/gpt-oss-20b"
+    static let defaultPostProcessingFallbackModel = "qwen/qwen3.8-27b"
+    static let defaultContextModel = "qwen/qwen3.8-27b"
+    private static let deprecatedDefaultPostProcessingFallbackModel = "meta-llama/llama-4-scout-17b-16e-instruct"
+    private static let deprecatedDefaultContextModel = "meta-llama/llama-4-scout-17b-16e-instruct"
     private static let trailingPressEnterCommandPattern = try! NSRegularExpression(
         pattern: #"(?i)(?:^|[ \t\r\n,;:\-]+)press[ \t\r\n]+enter[\s\p{P}]*$"#
     )
@@ -300,6 +307,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     @Published var apiKey: String {
         didSet {
+            guard !isApplyingAPIConfiguration else { return }
             persistAPIKey(apiKey)
             rebuildContextService()
         }
@@ -307,6 +315,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     @Published var apiBaseURL: String {
         didSet {
+            guard !isApplyingAPIConfiguration else { return }
             persistAPIBaseURL(apiBaseURL)
             rebuildContextService()
         }
@@ -314,15 +323,20 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     @Published var transcriptionAPIURL: String {
         didSet {
+            guard !isApplyingAPIConfiguration else { return }
             persistOptionalAPIValue(transcriptionAPIURL, account: transcriptionAPIURLStorageKey)
         }
     }
 
     @Published var transcriptionAPIKey: String {
         didSet {
+            guard !isApplyingAPIConfiguration else { return }
             persistOptionalAPIValue(transcriptionAPIKey, account: transcriptionAPIKeyStorageKey)
         }
     }
+
+    // Publish only after the complete configuration transaction has persisted.
+    @Published private(set) var committedAPIConfiguration: ValidatedAPIConfiguration
 
     @Published var transcriptionModel: String {
         didSet {
@@ -439,6 +453,22 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
+    @Published var instructionExecutionGuardEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                instructionExecutionGuardEnabled,
+                forKey: instructionExecutionGuardEnabledStorageKey
+            )
+        }
+    }
+
+    @Published var desktopScreenshotFallbackEnabled: Bool {
+        didSet {
+            DesktopScreenshotFallbackPreference.save(desktopScreenshotFallbackEnabled, to: .standard)
+            rebuildContextService()
+        }
+    }
+
     @Published var contextScreenshotMaxDimension: Int {
         didSet {
             let normalizedDimension = Self.normalizedContextScreenshotMaxDimension(contextScreenshotMaxDimension)
@@ -515,6 +545,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
     @Published var preserveClipboard: Bool {
         didSet {
             UserDefaults.standard.set(preserveClipboard, forKey: preserveClipboardStorageKey)
+        }
+    }
+
+    @Published var preserveExactWording: Bool {
+        didSet {
+            UserDefaults.standard.set(preserveExactWording, forKey: preserveExactWordingStorageKey)
+        }
+    }
+
+    @Published var keepDictationInClipboardHistory: Bool {
+        didSet {
+            UserDefaults.standard.set(keepDictationInClipboardHistory, forKey: keepDictationInClipboardHistoryStorageKey)
         }
     }
 
@@ -639,6 +681,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     private var pendingMicrophonePermissionSelectionSnapshot: AppSelectionSnapshot?
     private var pendingMicrophonePermissionManualCommandRequested: Bool?
     private var pendingMicrophonePermissionShouldSendToJarvis = false
+    private var isApplyingAPIConfiguration = false
     private let postTranscriptionUpdateReminderDuration: TimeInterval = 7
     private var jarvisSendFlashToken: UUID?
     private var isRecoveringUnfinishedTranscriptions = false
@@ -652,12 +695,17 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let hasCompletedSetup = (UserDefaults.standard.object(forKey: "hasCompletedSetup") as? Bool) ?? true
         let apiKey = Self.loadStoredAPIKey(account: apiKeyStorageKey)
         let apiBaseURL = Self.loadStoredAPIBaseURL(account: "api_base_url")
+        for key in [contextModelStorageKey, postProcessingModelStorageKey, postProcessingFallbackModelStorageKey] {
+            ModelConfiguration.migrateGroqSelection(key: key, baseURL: apiBaseURL, defaults: .standard)
+        }
         let transcriptionModel = UserDefaults.standard.string(forKey: transcriptionModelStorageKey) ?? Self.defaultTranscriptionModel
         let transcriptionAPIURL = Self.loadOptionalStoredAPIValue(account: transcriptionAPIURLStorageKey)
         let transcriptionAPIKey = Self.loadStoredAPIKey(account: transcriptionAPIKeyStorageKey)
         let postProcessingModel = UserDefaults.standard.string(forKey: postProcessingModelStorageKey) ?? Self.defaultPostProcessingModel
-        let postProcessingFallbackModel = UserDefaults.standard.string(forKey: postProcessingFallbackModelStorageKey) ?? Self.defaultPostProcessingFallbackModel
-        let contextModel = UserDefaults.standard.string(forKey: contextModelStorageKey) ?? Self.defaultContextModel
+        let postProcessingFallbackModel = Self.loadStoredPostProcessingFallbackModel(
+            key: postProcessingFallbackModelStorageKey
+        )
+        let contextModel = Self.loadStoredContextModel(key: contextModelStorageKey)
         let shortcuts = Self.loadShortcutConfiguration(
             holdKey: holdShortcutStorageKey,
             toggleKey: toggleShortcutStorageKey,
@@ -681,12 +729,18 @@ final class AppState: ObservableObject, @unchecked Sendable {
         )
         let customSystemPrompt = UserDefaults.standard.string(forKey: customSystemPromptStorageKey) ?? ""
         let customContextPrompt = UserDefaults.standard.string(forKey: customContextPromptStorageKey) ?? ""
+        let instructionExecutionGuardEnabled = UserDefaults.standard.object(
+            forKey: instructionExecutionGuardEnabledStorageKey
+        ) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: instructionExecutionGuardEnabledStorageKey)
         let customSystemPromptLastModified = UserDefaults.standard.string(forKey: customSystemPromptLastModifiedStorageKey) ?? ""
         let customContextPromptLastModified = UserDefaults.standard.string(forKey: customContextPromptLastModifiedStorageKey) ?? ""
         let outputLanguage = UserDefaults.standard.string(forKey: outputLanguageStorageKey) ?? ""
         let storedContextScreenshotMaxDimension = UserDefaults.standard.object(forKey: contextScreenshotMaxDimensionStorageKey) != nil
             ? UserDefaults.standard.integer(forKey: contextScreenshotMaxDimensionStorageKey)
             : Self.defaultContextScreenshotMaxDimension
+        let desktopScreenshotFallbackEnabled = DesktopScreenshotFallbackPreference.load(from: .standard)
         let contextScreenshotMaxDimension = Self.normalizedContextScreenshotMaxDimension(storedContextScreenshotMaxDimension)
         let shortcutStartDelay = max(0, UserDefaults.standard.double(forKey: shortcutStartDelayStorageKey))
         let isCommandModeEnabled = UserDefaults.standard.object(forKey: commandModeEnabledStorageKey) == nil
@@ -701,6 +755,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
         let preserveClipboard = UserDefaults.standard.object(forKey: preserveClipboardStorageKey) == nil
             ? true
             : UserDefaults.standard.bool(forKey: preserveClipboardStorageKey)
+        let preserveExactWording = UserDefaults.standard.bool(forKey: preserveExactWordingStorageKey)
+        let keepDictationInClipboardHistory = UserDefaults.standard.bool(forKey: keepDictationInClipboardHistoryStorageKey)
         let realtimeStreamingEnabled = UserDefaults.standard.bool(forKey: realtimeStreamingEnabledStorageKey)
         let realtimeStreamingModel = UserDefaults.standard.string(forKey: realtimeStreamingModelStorageKey) ?? ""
         let onDeviceTranscriptionEnabled = UserDefaults.standard.bool(forKey: onDeviceTranscriptionEnabledStorageKey)
@@ -740,13 +796,20 @@ final class AppState: ObservableObject, @unchecked Sendable {
             baseURL: apiBaseURL,
             customContextPrompt: customContextPrompt,
             contextModel: contextModel,
-            contextScreenshotMaxDimension: contextScreenshotMaxDimension
+            contextScreenshotMaxDimension: contextScreenshotMaxDimension,
+            desktopScreenshotFallbackEnabled: desktopScreenshotFallbackEnabled
         )
         self.hasCompletedSetup = hasCompletedSetup
         self.apiKey = apiKey
         self.apiBaseURL = apiBaseURL
         self.transcriptionAPIURL = transcriptionAPIURL
         self.transcriptionAPIKey = transcriptionAPIKey
+        self.committedAPIConfiguration = ValidatedAPIConfiguration(
+            apiKey: apiKey,
+            baseURL: apiBaseURL,
+            transcriptionAPIURL: transcriptionAPIURL,
+            transcriptionAPIKey: transcriptionAPIKey
+        )
         self.transcriptionModel = transcriptionModel
         self.postProcessingModel = postProcessingModel
         self.postProcessingFallbackModel = postProcessingFallbackModel
@@ -764,12 +827,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         self.transcriptionLanguage = transcriptionLanguage
         self.customSystemPrompt = customSystemPrompt
         self.customContextPrompt = customContextPrompt
+        self.instructionExecutionGuardEnabled = instructionExecutionGuardEnabled
+        self.desktopScreenshotFallbackEnabled = desktopScreenshotFallbackEnabled
         self.contextScreenshotMaxDimension = contextScreenshotMaxDimension
         self.customSystemPromptLastModified = customSystemPromptLastModified
         self.customContextPromptLastModified = customContextPromptLastModified
         self.outputLanguage = outputLanguage
         self.shortcutStartDelay = shortcutStartDelay
         self.preserveClipboard = preserveClipboard
+        self.preserveExactWording = preserveExactWording
+        self.keepDictationInClipboardHistory = keepDictationInClipboardHistory
         self.realtimeStreamingEnabled = realtimeStreamingEnabled
         self.realtimeStreamingModel = realtimeStreamingModel
         self.onDeviceTranscriptionEnabled = onDeviceTranscriptionEnabled
@@ -865,7 +932,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
     }
 
-    static let defaultAPIBaseURL = "https://api.groq.com/openai/v1"
+    static let defaultAPIBaseURL = APIConfigurationSaveFlow.defaultBaseURL
 
     private struct StoredShortcutConfiguration {
         let hold: ShortcutBinding
@@ -892,6 +959,34 @@ final class AppState: ObservableObject, @unchecked Sendable {
             return stored
         }
         return defaultAPIBaseURL
+    }
+
+    private static func loadStoredContextModel(key: String) -> String {
+        guard let stored = UserDefaults.standard.string(forKey: key) else {
+            return defaultContextModel
+        }
+
+        let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == deprecatedDefaultContextModel {
+            UserDefaults.standard.set(defaultContextModel, forKey: key)
+            return defaultContextModel
+        }
+
+        return trimmed.isEmpty ? defaultContextModel : trimmed
+    }
+
+    private static func loadStoredPostProcessingFallbackModel(key: String) -> String {
+        guard let stored = UserDefaults.standard.string(forKey: key) else {
+            return defaultPostProcessingFallbackModel
+        }
+
+        let trimmed = stored.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == deprecatedDefaultPostProcessingFallbackModel {
+            UserDefaults.standard.set(defaultPostProcessingFallbackModel, forKey: key)
+            return defaultPostProcessingFallbackModel
+        }
+
+        return trimmed.isEmpty ? defaultPostProcessingFallbackModel : trimmed
     }
 
     private static func loadShortcutConfiguration(
@@ -963,14 +1058,16 @@ final class AppState: ObservableObject, @unchecked Sendable {
         baseURL: String,
         customContextPrompt: String,
         contextModel: String,
-        contextScreenshotMaxDimension: Int
+        contextScreenshotMaxDimension: Int,
+        desktopScreenshotFallbackEnabled: Bool
     ) -> AppContextService {
         AppContextService(
             apiKey: apiKey,
             baseURL: baseURL,
             customContextPrompt: customContextPrompt,
             contextModel: contextModel,
-            screenshotMaxDimension: CGFloat(normalizedContextScreenshotMaxDimension(contextScreenshotMaxDimension))
+            screenshotMaxDimension: CGFloat(normalizedContextScreenshotMaxDimension(contextScreenshotMaxDimension)),
+            desktopScreenshotFallbackEnabled: desktopScreenshotFallbackEnabled
         )
     }
 
@@ -980,7 +1077,33 @@ final class AppState: ObservableObject, @unchecked Sendable {
             baseURL: apiBaseURL,
             customContextPrompt: customContextPrompt,
             contextModel: contextModel,
-            contextScreenshotMaxDimension: contextScreenshotMaxDimension
+            contextScreenshotMaxDimension: contextScreenshotMaxDimension,
+            desktopScreenshotFallbackEnabled: desktopScreenshotFallbackEnabled
+        )
+    }
+
+    func updateAPIConfiguration(
+        apiKey: String,
+        baseURL: String,
+        transcriptionAPIURL: String,
+        transcriptionAPIKey: String
+    ) {
+        isApplyingAPIConfiguration = true
+        self.apiKey = apiKey
+        self.apiBaseURL = baseURL
+        self.transcriptionAPIURL = transcriptionAPIURL
+        self.transcriptionAPIKey = transcriptionAPIKey
+        isApplyingAPIConfiguration = false
+        persistAPIKey(apiKey)
+        persistAPIBaseURL(baseURL)
+        persistOptionalAPIValue(transcriptionAPIURL, account: transcriptionAPIURLStorageKey)
+        persistOptionalAPIValue(transcriptionAPIKey, account: transcriptionAPIKeyStorageKey)
+        rebuildContextService()
+        committedAPIConfiguration = ValidatedAPIConfiguration(
+            apiKey: apiKey,
+            baseURL: baseURL,
+            transcriptionAPIURL: transcriptionAPIURL,
+            transcriptionAPIKey: transcriptionAPIKey
         )
     }
 
@@ -1011,6 +1134,15 @@ final class AppState: ObservableObject, @unchecked Sendable {
         return stored.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// English name of the language selected in Transcription Language, which
+    /// cleanup is asked to keep. Empty on Auto-detect: nothing is detected from
+    /// the transcript.
+    private static func dictationLanguageName(for language: String) -> String {
+        let normalized = normalizeTranscriptionLanguage(language)
+        guard !normalized.isEmpty else { return "" }
+        return transcriptionLanguageOptions.first { $0.code == normalized }?.name ?? ""
+    }
+
     private static func normalizeTranscriptionLanguage(_ language: String) -> String {
         let normalized = language.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard transcriptionLanguageOptions.contains(where: { $0.code == normalized }) else {
@@ -1034,7 +1166,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             apiKey: resolvedTranscriptionAPIKey,
             baseURL: resolvedTranscriptionBaseURL,
             transcriptionModel: transcriptionModel,
-            language: resolvedTranscriptionLanguage
+            language: resolvedTranscriptionLanguage,
+            vocabularyPrompt: effectiveVoiceVocabulary
         )
     }
 
@@ -1295,7 +1428,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
             apiKey: apiKey,
             baseURL: PostProcessingService.resolvedPostProcessingBaseURL(),
             preferredModel: postProcessingModel,
-            preferredFallbackModel: postProcessingFallbackModel
+            preferredFallbackModel: postProcessingFallbackModel,
+            instructionExecutionGuardEnabled: instructionExecutionGuardEnabled
         )
         let capturedCustomVocabulary = customVocabulary
         let capturedCustomSystemPrompt = customSystemPrompt
@@ -1323,7 +1457,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                     postProcessingService: postProcessingService,
                     customVocabulary: capturedCustomVocabulary,
                     customSystemPrompt: capturedCustomSystemPrompt,
-                    outputLanguage: self.outputLanguage
+                    outputLanguage: self.outputLanguage,
+                    dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
+                    preserveExactWording: self.preserveExactWording
                 )
                 finalTranscript = result.finalTranscript
                 processingStatus = Self.statusMessage(
@@ -1514,6 +1650,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     func startAccessibilityPolling() {
         accessibilityTimer?.invalidate()
+        accessibilityTimer = nil
         hasAccessibility = AXIsProcessTrusted()
         hasScreenRecordingPermission = hasScreenCapturePermission()
         let postProcessingEnabled = (UserDefaults.standard.object(forKey: "post_processing_enabled") as? Bool) ?? false
@@ -1859,6 +1996,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
     func startHotkeyMonitoring() {
         shouldMonitorHotkeys = true
+        hotkeyManager.onUndoDictation = { [weak self] in
+            Task { @MainActor in
+                guard let self, !self.isRecording, !self.isTranscribing else { return }
+                self.undoLastVoiceInsertion()
+            }
+        }
         hotkeyManager.onShortcutEvent = { [weak self] event in
             DispatchQueue.main.async {
                 self?.handleShortcutEvent(event)
@@ -1971,10 +2114,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
     /// trigger shortcut to be fully released.
     func copyLastTranscriptToPasteboard() {
         guard !lastTranscript.isEmpty else { return }
-        let pendingClipboardRestore = writeTranscriptToPasteboard(lastTranscript)
-        pasteAtCursorWhenShortcutReleased { [weak self] in
-            self?.restoreClipboardIfNeeded(pendingClipboardRestore)
-        }
+        Task { @MainActor in self.deliverVoiceText(self.lastTranscript) }
     }
 
     private func sendLastTranscriptToJarvis() {
@@ -2265,7 +2405,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         activeRecordingTriggerMode = triggerMode
         currentSessionShouldSendToJarvis = pendingOrbJarvisRecordingStart && JarvisMode.isEnabled
         pendingOrbJarvisRecordingStart = false
-        guard hasAccessibility else {
+        let isAccessibilityTrusted = AXIsProcessTrusted()
+        hasAccessibility = isAccessibilityTrusted
+        guard isAccessibilityTrusted else {
             if currentSessionShouldSendToJarvis {
                 JarvisMode.set(false)
             }
@@ -2503,6 +2645,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
         statusText = "Starting..."
         hasShownScreenshotPermissionAlert = false
 
+
         audioLevelCancellable = audioRecorder.$audioLevel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] level in
@@ -2531,26 +2674,26 @@ final class AppState: ObservableObject, @unchecked Sendable {
         // Transition to waveform when first real audio arrives (any non-zero RMS)
         let deviceUID = selectedMicrophoneID
         audioRecorder.onRecordingReady = { [weak self] in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.cancelRecordingInitializationTimer()
-                os_log(.info, log: recordingLog, "first real audio — transitioning to waveform")
-                self.statusText = "Recording..."
-                self.clearPendingOverlayDismissToken()
-                if overlayShown {
-                    self.overlayManager.transitionToRecording(
-                        mode: self.activeRecordingTriggerMode ?? triggerMode,
-                        isCommandMode: self.currentSessionIntent.isCommandMode
-                    )
-                } else {
-                    self.overlayManager.showRecording(
-                        mode: self.activeRecordingTriggerMode ?? triggerMode,
-                        isCommandMode: self.currentSessionIntent.isCommandMode
-                    )
-                }
-                overlayShown = true
-                self.playAlertSound(named: "Tink")
+            // The recorder already delivers on main after validating the generation.
+            // Do not enqueue again: cancellation could invalidate it between main-queue blocks.
+            guard let self, self.isRecording, self.activeRecordingTriggerMode != nil else { return }
+            self.cancelRecordingInitializationTimer()
+            os_log(.info, log: recordingLog, "first real audio — transitioning to waveform")
+            self.statusText = "Recording..."
+            self.clearPendingOverlayDismissToken()
+            if overlayShown {
+                self.overlayManager.transitionToRecording(
+                    mode: self.activeRecordingTriggerMode ?? triggerMode,
+                    isCommandMode: self.currentSessionIntent.isCommandMode
+                )
+            } else {
+                self.overlayManager.showRecording(
+                    mode: self.activeRecordingTriggerMode ?? triggerMode,
+                    isCommandMode: self.currentSessionIntent.isCommandMode
+                )
             }
+            overlayShown = true
+            self.playAlertSound(named: "Tink")
         }
         audioRecorder.onRecordingFailure = { [weak self] error in
             DispatchQueue.main.async {
@@ -2571,7 +2714,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
             do {
                 try self.audioRecorder.startRecording(deviceUID: deviceUID)
                 os_log(.info, log: recordingLog, "audioRecorder.startRecording() done: %.3fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [self] in
                     guard self.isRecording, self.activeRecordingTriggerMode != nil else { return }
                     self.startContextCapture()
                 }
@@ -2635,6 +2778,13 @@ final class AppState: ObservableObject, @unchecked Sendable {
         }
 
         return "Failed to start recording: \(error.localizedDescription)"
+    }
+
+    private func formattedTranscriptionError(_ error: Error) -> String {
+        TranscriptionErrorPresentationCore.message(
+            for: error,
+            isOnline: NetworkMonitor.shared.isOnline
+        )
     }
 
     func showMicrophonePermissionAlert() {
@@ -2746,6 +2896,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
         case postProcessingSkipped
         case postProcessingSucceeded
         case postProcessingFailedFallback
+        case preservedExactWording
+        case preservedExactWordingTranslated
+        case preservedExactWordingTranslationFailedFallback
         case commandModeSucceeded(invocation: CommandInvocation)
         case commandModeFailedFallback(invocation: CommandInvocation)
 
@@ -2763,12 +2916,22 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return isRetry
                     ? "Post-processing failed on retry, using raw transcript"
                     : "Post-processing failed, using raw transcript"
+            case .preservedExactWording:
+                return "Preserved exact wording, skipped post-processing"
+            case .preservedExactWordingTranslated:
+                return "Preserved exact wording, translated to output language"
+            case .preservedExactWordingTranslationFailedFallback:
+                return "Verbatim translation failed, using untranslated raw transcript"
             case .commandModeSucceeded(let invocation):
                 return "Edit mode succeeded (\(invocation.rawValue))"
             case .commandModeFailedFallback(let invocation):
                 return "Edit mode failed, using selected text (\(invocation.rawValue))"
             }
         }
+    }
+
+    private var effectiveVoiceVocabulary: String {
+        ([customVocabulary] + VoicePersonalization.customVocabulary()).filter { !$0.isEmpty }.joined(separator: ", ")
     }
 
     private func processTranscript(
@@ -2778,7 +2941,48 @@ final class AppState: ObservableObject, @unchecked Sendable {
         postProcessingService: PostProcessingService,
         customVocabulary: String,
         customSystemPrompt: String,
-        outputLanguage: String = ""
+        outputLanguage: String = "",
+        dictationLanguage: String = "",
+        preserveExactWording: Bool,
+        overrideMode: VoiceMode? = nil
+    ) async -> (finalTranscript: String, outcome: TranscriptProcessingOutcome, prompt: String) {
+        // Selection editing retains its own semantics; modes apply only to dictation.
+        if case .command = intent {
+            return await processTranscriptCore(rawTranscript, intent: intent, context: context,
+                postProcessingService: postProcessingService, customVocabulary: effectiveVoiceVocabulary,
+                customSystemPrompt: customSystemPrompt, outputLanguage: outputLanguage,
+                dictationLanguage: dictationLanguage, preserveExactWording: preserveExactWording)
+        }
+        let resolved = VoicePersonalization.resolve(rawTranscript, bundleIdentifier: context.bundleIdentifier)
+        let mode = overrideMode ?? resolved.mode
+        var input = resolved.text
+        if mode == .agent {
+            input = input.replacingOccurrences(of: #"(?i)[,\s]+send it[.!?]*\s*$"#, with: "", options: .regularExpression)
+        }
+        let prompt = mode.instructions.isEmpty ? customSystemPrompt
+            : Self.resolvedSystemPrompt(customSystemPrompt) + "\n\n" + mode.instructions
+        let result = await processTranscriptCore(input, intent: intent, context: context,
+            postProcessingService: postProcessingService,
+            customVocabulary: ([customVocabulary] + VoicePersonalization.customVocabulary()).joined(separator: ", "),
+            customSystemPrompt: prompt, outputLanguage: outputLanguage,
+            dictationLanguage: dictationLanguage,
+            preserveExactWording: mode == .verbatim || (mode == .standard && preserveExactWording),
+            forcePostProcessing: mode != .standard)
+        let replaced = VoicePersonalization.applyReplacements(to: result.finalTranscript)
+        return (VoicePersonalization.expandSnippets(in: replaced), result.outcome, result.prompt)
+    }
+
+    private func processTranscriptCore(
+        _ rawTranscript: String,
+        intent: SessionIntent,
+        context: AppContext,
+        postProcessingService: PostProcessingService,
+        customVocabulary: String,
+        customSystemPrompt: String,
+        outputLanguage: String = "",
+        dictationLanguage: String = "",
+        preserveExactWording: Bool,
+        forcePostProcessing: Bool = false
     ) async -> (finalTranscript: String, outcome: TranscriptProcessingOutcome, prompt: String) {
         let trimmedRawTranscript = rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -2788,7 +2992,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
         // post_processing_enabled must be explicitly set to true; absent = disabled.
         let postProcessingEnabled = (UserDefaults.standard.object(forKey: "post_processing_enabled") as? Bool) ?? false
-        guard postProcessingEnabled else {
+        guard postProcessingEnabled || forcePostProcessing || preserveExactWording else {
             return (trimmedRawTranscript, .postProcessingSkipped, "")
         }
 
@@ -2812,14 +3016,45 @@ final class AppState: ObservableObject, @unchecked Sendable {
             os_log(.info, log: recordingLog, "Voice macro triggered: %{public}@", macro.command)
             return (macro.payload, .voiceMacro(command: macro.command), "")
         }
-        
+
+        // Preserve-exact-wording mode. Two sub-cases so translation
+        // stays honored:
+        //
+        //   1. No Output Language set — skip the LLM entirely and
+        //      return the raw transcript verbatim.
+        //   2. Output Language IS set — route through a stripped-down
+        //      translate-only prompt. The user asked for another
+        //      language; silently dropping translation defeats their
+        //      settings. The translate-only path preserves filler,
+        //      informal wording, and profanity 1:1 while still hitting
+        //      the target language.
+        if preserveExactWording {
+            let targetLanguage = outputLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+            if targetLanguage.isEmpty {
+                return (trimmedRawTranscript, .preservedExactWording, "")
+            }
+            do {
+                let result = try await postProcessingService.translateVerbatim(
+                    transcript: trimmedRawTranscript,
+                    targetLanguage: targetLanguage
+                )
+                return (result.transcript, .preservedExactWordingTranslated, result.prompt)
+            } catch {
+                os_log(.error, log: recordingLog,
+                       "Verbatim translation failed: %{public}@",
+                       error.localizedDescription)
+                return (trimmedRawTranscript, .preservedExactWordingTranslationFailedFallback, "")
+            }
+        }
+
         do {
             let result = try await postProcessingService.postProcess(
                 transcript: trimmedRawTranscript,
                 context: context,
                 customVocabulary: customVocabulary,
                 customSystemPrompt: customSystemPrompt,
-                outputLanguage: outputLanguage
+                outputLanguage: outputLanguage,
+                dictationLanguage: dictationLanguage
             )
             return (result.transcript, .postProcessingSucceeded, result.prompt)
         } catch {
@@ -3091,7 +3326,9 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         postProcessingService: postProcessingService,
                         customVocabulary: self.customVocabulary,
                         customSystemPrompt: self.customSystemPrompt,
-                        outputLanguage: self.outputLanguage
+                        outputLanguage: self.outputLanguage,
+                        dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
+                        preserveExactWording: self.preserveExactWording
                     )
                     self.logTiming(timingTracker, "processTranscript END")
                     try Task.checkCancellation()
@@ -3132,7 +3369,7 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         // only consumers are the history list and the audio cleanup
                         // decision, both of which are fine a tick later. Defer it so
                         // the user's text lands first and the disk write happens after.
-                        let saveHistory = { [weak self] in
+                        let saveHistory: @MainActor @Sendable () -> Void = { [weak self] in
                             guard let self else { return }
                             let historySaved = self.recordPipelineHistoryEntry(
                                 rawTranscript: trimmedRawTranscript,
@@ -3164,7 +3401,8 @@ final class AppState: ObservableObject, @unchecked Sendable {
 
                         let shouldPersistRawDictationFallback: Bool
                         switch result.outcome {
-                        case .postProcessingFailedFallback:
+                        case .postProcessingFailedFallback,
+                             .preservedExactWordingTranslationFailedFallback:
                             shouldPersistRawDictationFallback = !trimmedFinalTranscript.isEmpty
                         default:
                             shouldPersistRawDictationFallback = false
@@ -3207,19 +3445,33 @@ final class AppState: ObservableObject, @unchecked Sendable {
                             // backspaces precede the paste, and only after the dictation
                             // shortcut is released.
                             let streamedRetractCount = self.consumeStreamedRetractCount()
-                            if !TranscriptRouter.deliver(trimmedFinalTranscript) {
-                                self.logTiming(timingTracker, "writeTranscriptToPasteboard START")
-                                let pendingClipboardRestore = self.writeTranscriptToPasteboard(trimmedFinalTranscript)
-                                self.logTiming(timingTracker, "writeTranscriptToPasteboard END")
-                                self.pasteAtCursorWhenShortcutReleased(retractCount: streamedRetractCount) {
-                                    self.logTiming(timingTracker, "paste fired")
-                                    if shouldPressEnterAfterPaste {
-                                        self.pressEnterAfterPaste {
-                                            self.restoreClipboardIfNeeded(pendingClipboardRestore)
-                                        }
-                                    } else {
-                                        self.restoreClipboardIfNeeded(pendingClipboardRestore)
+                            let resolvedMode = VoicePersonalization.resolve(trimmedRawTranscript,
+                                bundleIdentifier: appContext.bundleIdentifier).mode
+                            if resolvedMode == .agent {
+                                self.performAfterShortcutReleased {
+                                    self.deleteStreamedCharacters(streamedRetractCount)
+                                    VoiceAgentDelivery.present(trimmedFinalTranscript)
+                                }
+                                self.statusText = "Review agent prompt"
+                            } else {
+                                let minimumWords = max(1, UserDefaults.standard.object(forKey: VoicePersonalization.draftMinimumWordsKey) as? Int ?? 80)
+                                let review = UserDefaults.standard.bool(forKey: VoicePersonalization.reviewDraftKey)
+                                    && trimmedFinalTranscript.split(whereSeparator: { $0.isWhitespace }).count >= minimumWords
+                                if review {
+                                    self.performAfterShortcutReleased {
+                                        self.deleteStreamedCharacters(streamedRetractCount)
+                                        DictationDraftPresenter.shared.present(text: trimmedFinalTranscript, onPaste: { edited in
+                                            self.lastTranscript = edited
+                                            if edited != trimmedFinalTranscript {
+                                                self.teachVoiceCorrection(original: trimmedFinalTranscript, corrected: edited)
+                                            }
+                                            self.deliverVoiceText(edited, pressEnter: shouldPressEnterAfterPaste)
+                                        }, onCancel: { self.statusText = "Draft cancelled; original kept in History" })
                                     }
+                                    self.statusText = "Review draft"
+                                } else {
+                                    self.deliverVoiceText(trimmedFinalTranscript,
+                                        retractCount: streamedRetractCount, pressEnter: shouldPressEnterAfterPaste)
                                 }
                             }
                         }
@@ -3261,11 +3513,12 @@ final class AppState: ObservableObject, @unchecked Sendable {
                         self.transcriptionTask = nil
                         self.transcribingAudioFileName = nil
                         self.audioPersistenceTask = nil
-                        self.errorMessage = error.localizedDescription
+                        let userFacingErrorMessage = self.formattedTranscriptionError(error)
+                        self.errorMessage = userFacingErrorMessage
                         self.isTranscribing = false
                         self.endCriticalDictationActivity()
-                        self.statusText = "Transcription failed"
-                        self.overlayManager.dismiss()
+                        self.statusText = "Error"
+                        self.overlayManager.showError(userFacingErrorMessage)
                         self.lastPostProcessedTranscript = ""
                         self.lastRawTranscript = ""
                         self.lastContextSummary = ""
@@ -3350,6 +3603,11 @@ final class AppState: ObservableObject, @unchecked Sendable {
             // dictation immediately before the paste. The fetch returns this same
             // list sorted by timestamp descending, and `newEntry` is by definition
             // the newest, so prepending it in memory is equivalent and O(1).
+            if case .dictation = intent {
+                VoiceProgressLedger.record(words: ShareCardStats.wordCount(of: newEntry),
+                    baseline: pipelineHistory.filter { !$0.debugStatus.hasPrefix("Reprocessed as ") }
+                        .reduce(0) { $0 + ShareCardStats.wordCount(of: $1) })
+            }
             pipelineHistory.insert(newEntry, at: 0)
             if pipelineHistory.count > historyFetchLimit {
                 pipelineHistory.removeLast(pipelineHistory.count - historyFetchLimit)
@@ -3902,33 +4160,39 @@ final class AppState: ObservableObject, @unchecked Sendable {
             textToWrite = transcript
         }
 
-        // Declare standard transient types alongside .string so well-behaved
-        // clipboard managers (Maccy, Raycast, Paste, Clipy, Flycut, etc.) skip
-        // recording this entry in their history. The text still pastes normally
-        // via Cmd-V — only clipboard history is affected.
-        //
-        // See: https://github.com/nicke5012/TransientPasteboardType
-        let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
-        let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
-        let autoGeneratedType = NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")
-        let legacyTransientType = NSPasteboard.PasteboardType("de.petermaurer.TransientPasteboardType")
+        if keepDictationInClipboardHistory {
+            // Plain write so clipboard managers record the dictation in history.
+            pasteboard.clearContents()
+            pasteboard.setString(textToWrite, forType: .string)
+        } else {
+            // Declare standard transient types alongside .string so well-behaved
+            // clipboard managers (Maccy, Raycast, Paste, Clipy, Flycut, etc.) skip
+            // recording this entry in their history. The text still pastes normally
+            // via Cmd-V — only clipboard history is affected.
+            //
+            // See: https://github.com/nicke5012/TransientPasteboardType
+            let transientType = NSPasteboard.PasteboardType("org.nspasteboard.TransientType")
+            let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+            let autoGeneratedType = NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")
+            let legacyTransientType = NSPasteboard.PasteboardType("de.petermaurer.TransientPasteboardType")
 
-        pasteboard.declareTypes([
-            .string,
-            transientType,
-            concealedType,
-            autoGeneratedType,
-            legacyTransientType
-        ], owner: nil)
+            pasteboard.declareTypes([
+                .string,
+                transientType,
+                concealedType,
+                autoGeneratedType,
+                legacyTransientType
+            ], owner: nil)
 
-        pasteboard.setString(textToWrite, forType: .string)
+            pasteboard.setString(textToWrite, forType: .string)
 
-        // Populate empty values for the marker types — some clipboard managers
-        // check the data presence rather than just the declared type.
-        pasteboard.setString("", forType: transientType)
-        pasteboard.setString("", forType: concealedType)
-        pasteboard.setString("", forType: autoGeneratedType)
-        pasteboard.setString("", forType: legacyTransientType)
+            // Populate empty values for the marker types — some clipboard managers
+            // check the data presence rather than just the declared type.
+            pasteboard.setString("", forType: transientType)
+            pasteboard.setString("", forType: concealedType)
+            pasteboard.setString("", forType: autoGeneratedType)
+            pasteboard.setString("", forType: legacyTransientType)
+        }
 
         guard let snapshot else { return nil }
         return PendingClipboardRestore(
@@ -4009,6 +4273,104 @@ final class AppState: ObservableObject, @unchecked Sendable {
                 return
             }
             self.statusText = "Ready"
+        }
+    }
+}
+
+extension AppState {
+    @MainActor
+    func deliverVoiceText(_ text: String, retractCount: Int = 0, pressEnter: Bool = false) {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        performAfterShortcutReleased { [weak self] in
+            guard let self else { return }
+            let targetPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            self.deleteStreamedCharacters(retractCount)
+            let pendingRestore = self.writeTranscriptToPasteboard(text)
+            if let targetPID {
+                // The pasteboard writer may append a trailing space after punctuation.
+                let insertedText = NSPasteboard.general.string(forType: .string) ?? text
+                DictationUndoController.shared.recordInsertion(text: insertedText, targetPID: targetPID)
+            }
+            self.pasteAtCursor()
+            if pressEnter {
+                self.pressEnterAfterPaste { self.restoreClipboardIfNeeded(pendingRestore) }
+            } else {
+                self.restoreClipboardIfNeeded(pendingRestore)
+            }
+            self.statusText = "Pasted at cursor"
+        }
+    }
+
+    @MainActor
+    func undoLastVoiceInsertion() {
+        statusText = DictationUndoController.shared.undoLastInsertion()
+            ? "Dictation undone" : "Cannot safely undo here; focus the original field without moving the cursor"
+    }
+
+    @MainActor
+    func teachVoiceCorrection(original: String, corrected: String) {
+        guard let change = VoiceLearning.correction(original: original, corrected: corrected) else {
+            statusText = "No short correction to learn; add a replacement manually"
+            return
+        }
+        let replacements = ReplacementStore()
+        guard !replacements.rules.contains(where: { $0.from == change.from && $0.to == change.to && $0.enabled }) else {
+            statusText = "Correction already learned"
+            return
+        }
+        replacements.add(from: change.from, to: change.to)
+        lastLearnedRuleID = replacements.rules.last?.id
+        let dictionary = DictionaryStore()
+        let previousIDs = Set(dictionary.terms.map(\.id))
+        dictionary.add(change.to)
+        lastLearnedTermID = dictionary.terms.first(where: { !previousIDs.contains($0.id) })?.id
+        statusText = "Correction learned — Undo learning is available in History or the menu"
+    }
+
+    @MainActor
+    func undoVoiceLearning() {
+        if let id = lastLearnedRuleID { ReplacementStore().remove(id) }
+        if let id = lastLearnedTermID { DictionaryStore().remove(id) }
+        lastLearnedRuleID = nil
+        lastLearnedTermID = nil
+        statusText = "Last learned correction removed"
+    }
+
+    @MainActor
+    func reprocessVoiceHistory(id: UUID, mode: VoiceMode) {
+        guard let item = pipelineHistory.first(where: { $0.id == id }), !retryingItemIDs.contains(id) else { return }
+        guard !item.rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            statusText = "Retry the recording first; this take has no transcript"
+            return
+        }
+        retryingItemIDs.insert(id)
+        let context = AppContext(appName: item.contextAppName, bundleIdentifier: item.contextBundleIdentifier,
+            windowTitle: item.contextWindowTitle, selectedText: nil, currentActivity: item.contextSummary,
+            contextSystemPrompt: nil, contextPrompt: nil, screenshotDataURL: nil,
+            screenshotMimeType: nil, screenshotError: nil)
+        let service = PostProcessingService(apiKey: apiKey,
+            baseURL: PostProcessingService.resolvedPostProcessingBaseURL(), preferredModel: postProcessingModel,
+            preferredFallbackModel: postProcessingFallbackModel, instructionExecutionGuardEnabled: instructionExecutionGuardEnabled)
+        Task { @MainActor in
+            defer { self.retryingItemIDs.remove(id) }
+            let result = await self.processTranscript(item.rawTranscript, intent: .dictation, context: context,
+                postProcessingService: service, customVocabulary: self.effectiveVoiceVocabulary,
+                customSystemPrompt: self.customSystemPrompt, outputLanguage: self.outputLanguage,
+                dictationLanguage: Self.dictationLanguageName(for: self.transcriptionLanguage),
+                preserveExactWording: false, overrideMode: mode)
+            let replay = PipelineHistoryItem(timestamp: Date(), rawTranscript: item.rawTranscript,
+                postProcessedTranscript: result.finalTranscript, postProcessingPrompt: result.prompt,
+                systemPrompt: Self.resolvedSystemPrompt(self.customSystemPrompt), contextSummary: item.contextSummary,
+                contextScreenshotDataURL: nil, contextScreenshotStatus: "Not captured for replay",
+                postProcessingStatus: result.outcome.statusMessage(isRetry: true), debugStatus: "Reprocessed as \(mode.title)",
+                customVocabulary: self.effectiveVoiceVocabulary, audioDurationSeconds: item.audioDurationSeconds,
+                contextAppName: item.contextAppName, contextBundleIdentifier: item.contextBundleIdentifier,
+                contextWindowTitle: item.contextWindowTitle)
+            do {
+                _ = try self.pipelineHistoryStore.append(replay, maxCount: self.maxPipelineHistoryCount)
+                self.reloadPipelineHistory()
+                self.statusText = "Reprocessed take saved to History"
+            } catch { self.statusText = "Could not save reprocessed take" }
         }
     }
 }

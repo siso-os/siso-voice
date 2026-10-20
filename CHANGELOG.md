@@ -8,6 +8,79 @@ This project uses semantic versioning for public releases. Use `MAJOR.MINOR.PATC
 - `MINOR` changes add user-visible features and improvements.
 - `PATCH` changes fix bugs, polish existing behavior, or make small internal improvements.
 
+## [1.3.1] - 2026-10-09
+
+### Fixed
+
+- The recording timer is now off by default. You can enable it in Settings; existing saved choices are preserved.
+
+## [1.3.0] - 2026-10-09
+
+### Added
+
+- An optional elapsed recording timer in the dictation overlay.
+- A setting to disable full-desktop screenshots when active-window capture is unavailable.
+
+### Improved
+
+- Context and fallback models now use Qwen 3.8 on Groq. Existing Groq Qwen 3.6 selections update automatically, while custom provider choices are preserved.
+- Context failures now show clear model, authentication, rate-limit, timeout, and response errors in run logs. Failed summaries are omitted from transcript cleanup and Edit Mode, including when retrying older entries.
+- Network failures provide clearer guidance when a VPN or proxy may be interrupting transcription.
+- Compatibility with newer Swift toolchains and reliability checks for dictation and releases.
+
+## [1.2.1] - 2026-08-11
+
+### Improved
+
+- Model pickers now show only currently supported Groq options, with context models limited to those that can analyze screenshots.
+
+### Fixed
+
+- Fixed typing lag in custom vocabulary and prompt editors by saving changes when editing finishes instead of after every keystroke.
+
+## [1.2.0] - 2026-07-14
+
+### Added
+
+- A Preserve exact wording option that skips transcript cleanup while still supporting literal translation, voice macros, and Edit Mode.
+- An instruction guard that retries or falls back to the literal transcript when cleanup appears to answer a dictated prompt instead of preserving it.
+- An option to keep dictations in clipboard-manager history.
+- A menu bar action for adding copied words directly to the custom vocabulary while avoiding duplicates.
+
+### Improved
+
+- Post-processing now switches to the fallback model immediately when the primary model is rate-limited, remembers daily limits across restarts, and shows their reset times in Settings.
+- The default fallback model now uses Qwen 3.6 27B, and models scheduled for Groq shutdown in July or August 2026 have been removed from the picker.
+- Transcription failures now distinguish network outages from slow providers and display clearer errors in the recording overlay.
+- The default context model now uses Qwen 3.6 27B and strips reasoning tags from context summaries.
+- Local model requests now honor their configured timeouts, and transcription uses response formats compatible with a wider range of OpenAI-style models.
+- Permission and update checks use fewer unnecessary background wakeups.
+
+### Fixed
+
+- Fixed a recording overlay resource leak that could leave hidden animations running after the overlay closed.
+
+## [1.1.0] - 2026-06-03
+
+### Added
+
+- Model pickers in Settings for post-processing, fallback, context, and transcription models, including Qwen 3 32B and custom model entries.
+- A recording overlay display picker for choosing the active window, primary display, or a specific connected monitor.
+- In-pill error notifications so transient failures such as network or provider errors are visible without opening logs.
+- Advanced timeout overrides for local model and slow network setups.
+
+### Improved
+
+- Retried dictations now place the successful transcript on the clipboard and update Paste Again.
+- Paste Again now preserves the latest raw transcript earlier in the dictation flow, so it remains useful if later cleanup or pasting fails.
+- Post-processing handles reasoning-oriented model output more cleanly, including Qwen thinking tags and providerless model aliases.
+
+### Fixed
+
+- Fixed cases where transcription could hang indefinitely when a provider accepted a connection but never returned a response.
+- Fixed false screen-recording permission alerts from unrelated permission messages.
+- Fixed duplicate in-pill error notifications being dismissed by an older timer.
+
 ## [1.0.0] - 2026-05-20
 
 FreeFlow is now considered feature-complete and stable enough for a 1.0 release.

@@ -78,6 +78,31 @@ struct MainWindowView: View {
         .frame(minWidth: 820, minHeight: 560)
         .background(SISOTheme.Colors.canvas)
         .onAppear(perform: reload)
+        .onReceive(NotificationCenter.default.publisher(for: .sisoTeachCorrection)) { note in
+            guard let original = note.userInfo?["original"] as? String,
+                  let corrected = note.userInfo?["corrected"] as? String else { return }
+            appState.teachVoiceCorrection(original: original, corrected: corrected)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .sisoUndoLearnedCorrection)) { _ in
+            appState.undoVoiceLearning()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .sisoReprocessHistory)) { note in
+            guard let id = note.userInfo?["id"] as? UUID,
+                  let rawMode = note.userInfo?["mode"] as? String,
+                  let mode = VoiceMode(rawValue: rawMode) else { return }
+            appState.reprocessVoiceHistory(id: id, mode: mode)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .sisoSendHistoryToAgent)) { note in
+            if let text = note.object as? String { VoiceAgentDelivery.present(text) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .sisoReuseTranscript)) { note in
+            if let text = note.object as? String {
+                appState.lastTranscript = text
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
+                appState.statusText = "Copied for reuse; focus your destination and use Paste Last Dictation"
+            }
+        }
     }
 
     @ViewBuilder
